@@ -57,7 +57,7 @@ def fetch_ticker(symbol: str) -> dict | None:
             console.print(f"[yellow]WARNING:[/yellow] {symbol} — no price data, skipping")
             return None
 
-        hist = t.history(period="1y")
+        hist = t.history(period="2y")
         if hist.empty:
             console.print(f"[yellow]WARNING:[/yellow] {symbol} — empty history, skipping")
             return None

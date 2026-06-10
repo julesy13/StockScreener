@@ -1,3 +1,6 @@
 yfinance
 pandas
 rich
+dash
+dash-bootstrap-components
+plotly
