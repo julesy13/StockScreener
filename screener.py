@@ -83,6 +83,9 @@ def fetch_ticker(symbol: str) -> dict | None:
 
         return {
             "Ticker": symbol,
+            "Company": info.get("shortName") or info.get("longName") or "",
+            "Sector": info.get("sector"),
+            "Spark": [round(float(v), 4) for v in closes.iloc[-22:]],
             "Price": price,
             "1D %": change_1d,
             "1W %": change_1w,
@@ -95,8 +98,8 @@ def fetch_ticker(symbol: str) -> dict | None:
             "Fwd P/E": info.get("forwardPE"),
             "PEG": info.get("pegRatio"),
             "EPS": info.get("trailingEps"),
-            "Rev Growth %": (info.get("revenueGrowth") or 0) * 100 or None,
-            "Profit Margin %": (info.get("profitMargins") or 0) * 100 or None,
+            "Rev Growth %": info["revenueGrowth"] * 100 if info.get("revenueGrowth") is not None else None,
+            "Profit Margin %": info["profitMargins"] * 100 if info.get("profitMargins") is not None else None,
             "52W High": high52,
             "52W Low": low52,
             "52W Pos %": pos52,
@@ -276,7 +279,7 @@ def main():
             f"[dim]Filter applied: {before} → {len(df)} ticker(s) passed[/dim]\n"
         )
 
-    df.to_csv(RESULTS_FILE, index=False)
+    df.drop(columns=["Spark"], errors="ignore").to_csv(RESULTS_FILE, index=False)
     console.print(f"[dim]Exported to {RESULTS_FILE}[/dim]\n")
 
     table = build_table(df)
