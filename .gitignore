@@ -5,3 +5,4 @@ results.csv
 .env
 venv/
 .venv/
+analyst_cache.json

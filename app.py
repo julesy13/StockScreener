@@ -3,6 +3,7 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -438,8 +439,9 @@ def fetch_yahoo_trending() -> set:
 
 
 def _is_us_stock_symbol(sym: str) -> bool:
-    # skip indices (^GSPC), futures/currencies (GC=F, EURUSD=X), foreign listings (WTB.L)
-    return bool(sym) and not any(c in sym for c in "^=.")
+    # skip indices (^GSPC), futures/currencies (GC=F, EURUSD=X), foreign listings (WTB.L),
+    # crypto (BTC-USD)
+    return bool(sym) and not any(c in sym for c in "^=.") and not sym.endswith("-USD")
 
 
 def build_news_trending(hours: int, force: bool = False):
@@ -489,6 +491,223 @@ def build_news_trending(hours: int, force: bool = False):
         })
     rows.sort(key=lambda r: (-r["Mentions"], -r["Trending"], -(r["Market Cap"] or 0)))
     return rows, len(recent)
+
+
+def _article(a) -> dict:
+    return {
+        "title":     a.get("title", ""),
+        "publisher": a.get("publisher", ""),
+        "link":      a.get("link", ""),
+        "time":      a.get("providerPublishTime") or 0,
+        "tickers":   [t for t in (a.get("relatedTickers") or []) if _is_us_stock_symbol(t)],
+    }
+
+
+_ticker_news_cache: dict = {}     # key -> (timestamp, [articles])
+
+
+def fetch_ticker_news(sym: str) -> list:
+    """Recent headlines for one stock (Yahoo search), cached 10 minutes."""
+    hit = _ticker_news_cache.get(sym)
+    if hit and time.time() - hit[0] < NEWS_CACHE_TTL:
+        return hit[1]
+    try:
+        news = yf.Search(sym, news_count=15, max_results=0).news or []
+    except Exception as e:
+        print(f"Ticker news '{sym}': {e}")
+        news = []
+    arts = [_article(a) for a in news]
+    if arts:
+        _ticker_news_cache[sym] = (time.time(), arts)
+    return arts
+
+
+ANALYST_NEWS_QUERIES = [
+    "analyst upgrade", "analyst downgrade", "price target raised", "price target cut",
+    "price target", "initiates coverage", "upgrades stock", "downgrades stock",
+    "reiterates rating", "analyst rating", "buy rating", "overweight rating", "outperform",
+]
+_ANALYST_KW = re.compile(
+    r"upgrad|downgrad|price target|\bPT\b|rating|initiat|reiterat|overweight|underweight|"
+    r"outperform|underperform|analyst", re.I)
+
+
+def fetch_analyst_headlines() -> list:
+    """Recent analyst-action headlines (rating changes, price targets, initiations)."""
+    hit = _ticker_news_cache.get("__analyst__")
+    if hit and time.time() - hit[0] < NEWS_CACHE_TTL:
+        return hit[1]
+    seen, arts = set(), []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for batch in pool.map(_search_news, ANALYST_NEWS_QUERIES):
+            for a in batch:
+                if (a.get("link") and a["link"] not in seen
+                        and _ANALYST_KW.search(a.get("title", ""))):
+                    seen.add(a["link"])
+                    arts.append(_article(a))
+    arts.sort(key=lambda h: h["time"], reverse=True)
+    if arts:
+        _ticker_news_cache["__analyst__"] = (time.time(), arts)
+    return arts
+
+# ── Analyst coverage data ─────────────────────────────────────────────────────
+# Source: Yahoo Finance quoteSummary (no key) — dated upgrade/downgrade/price-target
+# history per stock, current rating distribution and consensus targets.
+# (MarketBeat, Benzinga, TipRanks and Seeking Alpha sit behind bot challenges.)
+ANALYST_CACHE_FILE = os.path.join(SCRIPT_DIR, "analyst_cache.json")
+ANALYST_TTL        = 6 * 3600
+ANALYST_UNIVERSE   = 200          # largest US stocks by market cap
+ANALYST_MAX_ROWS   = 60
+ANALYST_WINDOWS    = {"1W": 7, "1M": 30, "3M": 91, "6M": 182, "1Y": 365}
+ANALYST_ACTIONS    = {"up": "Upgrade", "down": "Downgrade", "init": "Initiates",
+                      "main": "Maintains", "reit": "Reiterates"}
+RATING_LABELS      = {"strong_buy": "Strong Buy", "buy": "Buy", "hold": "Hold",
+                      "underperform": "Underperform", "sell": "Sell", "none": ""}
+
+_analyst      = {"ts": 0.0, "records": []}
+_analyst_lock = threading.Lock()
+
+
+def _raw(v):
+    return v.get("raw") if isinstance(v, dict) else v
+
+
+def _fetch_analyst_one(sym: str) -> dict | None:
+    try:
+        d = _yahoo.get_json(
+            f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}",
+            {"modules": "upgradeDowngradeHistory,recommendationTrend,financialData"})
+        res = (d.get("quoteSummary", {}).get("result") or [None])[0]
+    except Exception as e:
+        print(f"Analyst data '{sym}': {e}")
+        return None
+    if not res:
+        return None
+    cutoff = time.time() - 370 * 86400
+    hist = [{
+        "t":     h.get("epochGradeDate") or 0,
+        "firm":  h.get("firm", ""),
+        "to":    h.get("toGrade", ""),
+        "from":  h.get("fromGrade", ""),
+        "action": h.get("action", ""),
+        "ptAct": h.get("priceTargetAction", ""),
+        "pt":    _raw(h.get("currentPriceTarget")) or None,
+        "ptOld": _raw(h.get("priorPriceTarget")) or None,
+    } for h in (res.get("upgradeDowngradeHistory") or {}).get("history", [])
+        if (h.get("epochGradeDate") or 0) >= cutoff]
+    trend = next((t for t in (res.get("recommendationTrend") or {}).get("trend", [])
+                  if t.get("period") == "0m"), {})
+    fd = res.get("financialData") or {}
+    return {
+        "Ticker":   sym,
+        "history":  sorted(hist, key=lambda h: h["t"], reverse=True),
+        "ratings":  [trend.get(k, 0) or 0 for k in ("strongBuy", "buy", "hold", "sell", "strongSell")],
+        "target":   _raw(fd.get("targetMeanPrice")),
+        "targetHi": _raw(fd.get("targetHighPrice")),
+        "targetLo": _raw(fd.get("targetLowPrice")),
+        "recKey":   fd.get("recommendationKey") or "none",
+        "recMean":  _raw(fd.get("recommendationMean")),
+        "analysts": _raw(fd.get("numberOfAnalystOpinions")),
+    }
+
+
+def load_analyst_data(force: bool = False) -> list:
+    """Analyst records for the universe; memory → disk cache → Yahoo (~30-60s)."""
+    with _analyst_lock:
+        now = time.time()
+        if not force and _analyst["records"] and now - _analyst["ts"] < ANALYST_TTL:
+            return _analyst["records"]
+        if not force and os.path.exists(ANALYST_CACHE_FILE):
+            try:
+                with open(ANALYST_CACHE_FILE) as f:
+                    disk = json.load(f)
+                if now - disk.get("ts", 0) < ANALYST_TTL and disk.get("records"):
+                    _analyst.update(ts=disk["ts"], records=disk["records"])
+                    return _analyst["records"]
+            except Exception:
+                pass
+
+        universe = yahoo_screen([], max_results=ANALYST_UNIVERSE)
+        if universe.empty:
+            return _analyst["records"]
+        info = {r["Ticker"]: r for r in universe.to_dict("records")}
+        # also cover stocks currently trending in the news, if loaded
+        extra = [s for s in {t for a in _news_cache["articles"][:300]
+                             for t in (a.get("relatedTickers") or [])}
+                 if _is_us_stock_symbol(s) and s not in info]
+        for q in (_yahoo.get_quotes(extra) if extra else []):
+            if q.get("quoteType") == "EQUITY":
+                info[q["symbol"]] = {"Ticker": q["symbol"],
+                                     "Company": q.get("shortName") or q.get("longName") or "",
+                                     "Price": q.get("regularMarketPrice"),
+                                     "1D %": q.get("regularMarketChangePercent"),
+                                     "Market Cap": q.get("marketCap")}
+        if _yahoo._s is None:
+            _yahoo._init()
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            fetched = list(pool.map(_fetch_analyst_one, list(info)))
+        records = []
+        for rec in fetched:
+            if not rec:
+                continue
+            base = info[rec["Ticker"]]
+            rec.update({k: base.get(k) for k in ("Company", "Price", "1D %", "Market Cap")})
+            for k, v in list(rec.items()):
+                if isinstance(v, float) and v != v:
+                    rec[k] = None
+            records.append(rec)
+        if records:
+            _analyst.update(ts=time.time(), records=records)
+            try:
+                with open(ANALYST_CACHE_FILE, "w") as f:
+                    json.dump({"ts": _analyst["ts"], "records": records}, f)
+            except Exception as e:
+                print(f"Analyst cache write: {e}")
+        return _analyst["records"]
+
+
+def analyst_window(records: list, window: str, sort: str, headlines: list | None = None):
+    """Rank stocks by analyst attention within the window: dated rating/price-target
+    actions (Yahoo) plus analyst-related headlines. Returns (rows, totals)."""
+    cutoff = time.time() - ANALYST_WINDOWS.get(window, 30) * 86400
+    heads_by = {}
+    for h in headlines or []:
+        if h["time"] >= cutoff:
+            for t in dict.fromkeys(h["tickers"]):
+                heads_by.setdefault(t, []).append(h)
+    rows = []
+    tot = {"actions": 0, "up": 0, "down": 0, "init": 0, "stocks": 0, "heads": 0}
+    for rec in records:
+        acts  = [h for h in rec["history"] if h["t"] >= cutoff]
+        heads = heads_by.get(rec["Ticker"], [])
+        if not acts and not heads:
+            continue
+        tot["heads"] += len(heads)
+        ups   = sum(a["action"] == "up" for a in acts)
+        downs = sum(a["action"] == "down" for a in acts)
+        inits = sum(a["action"] == "init" for a in acts)
+        tot["actions"] += len(acts); tot["up"] += ups; tot["down"] += downs
+        tot["init"] += inits; tot["stocks"] += 1
+        price, target = rec.get("Price"), rec.get("target")
+        rows.append({
+            **{k: rec.get(k) for k in ("Ticker", "Company", "Price", "1D %", "Market Cap",
+                                       "ratings", "target", "targetHi", "targetLo",
+                                       "recKey", "recMean", "analysts")},
+            "actions": acts, "n": len(acts), "ups": ups, "downs": downs, "inits": inits,
+            "heads": len(heads), "score": len(acts) + len(heads),
+            "firms": len({a["firm"] for a in acts}),
+            "ptUp":   sum(a["ptAct"] == "Raises" for a in acts),
+            "ptDown": sum(a["ptAct"] == "Lowers" for a in acts),
+            "upside": (target / price - 1) * 100 if _ok(price) and _ok(target) and price else None,
+        })
+    keys = {
+        "coverage":   lambda r: (-r["score"], -r["firms"]),
+        "upgrades":   lambda r: (-r["ups"], -(r["ups"] - r["downs"]), -r["score"]),
+        "downgrades": lambda r: (-r["downs"], -(r["downs"] - r["ups"]), -r["score"]),
+        "upside":     lambda r: (-(r["upside"] if r["upside"] is not None else -1e9), -r["score"]),
+    }
+    rows.sort(key=keys.get(sort, keys["coverage"]))
+    return rows[:ANALYST_MAX_ROWS], tot
 
 # ── Format helpers ────────────────────────────────────────────────────────────
 def _ok(v):
@@ -545,10 +764,11 @@ def _page_head(title, sub, actions=None):
     ], className="page-head")
 
 def _panel(children, title=None, sub=None, right=None, className="", **kw):
+    # note: Dash components with no children are falsy, so test against None
     head = None
-    if title or right:
+    if title is not None or right is not None:
         head = html.Div([
-            html.Div(_kids(html.Div(title, className="panel-title") if title else None,
+            html.Div(_kids(html.Div(title, className="panel-title") if title is not None else None,
                            html.Div(sub, className="panel-sub") if sub else None)),
             html.Div(right) if right is not None else None,
         ], className="panel-head")
@@ -590,7 +810,7 @@ def _spark_src(values, w=76, h=28, stretch=False):
     return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
 
 def _quote_card(ticker, id_type, sel_color=None, *, company="", price=None, change=None,
-                spark=None, stats=(), note=None, badge=None):
+                spark=None, stats=(), note=None, badge=None, extra=None):
     """Unified clickable stock card used by Screener, Sectors and News."""
     src = _spark_src(spark)
     return html.Div(
@@ -606,6 +826,7 @@ def _quote_card(ticker, id_type, sel_color=None, *, company="", price=None, chan
             html.Div(company or "\u00a0", className="qcard-name", title=company),
             html.Div([html.Span(_price(price), className="qcard-price"), _chip(change)],
                      className="qcard-pricerow"),
+            extra,
             html.Div([html.Span([html.Span(k, className="stat-k"),
                                  html.Span(v, className=_cx("stat-v", cls))])
                       for k, v, cls in stats] +
@@ -618,6 +839,102 @@ def _quote_card(ticker, id_type, sel_color=None, *, company="", price=None, chan
 
 def _sel_color(ticker, selected):
     return CHART_COLORS[selected.index(ticker) % len(CHART_COLORS)] if ticker in selected else None
+
+
+def _headline_items(pool: list, sel=(), limit=40):
+    sel = set(sel or [])
+    items = [
+        html.A([
+            html.Div(h["title"], className="news-title"),
+            html.Div([
+                html.Span(h["publisher"]), html.Span("·"), html.Span(_time_ago(h["time"])),
+                *[html.Span(t, className=_cx("news-tk", "is-sel" if t in sel else ""))
+                  for t in sorted(h["tickers"], key=lambda t: t not in sel)[:6]],
+            ], className="news-meta"),
+        ], href=h["link"], target="_blank", rel="noopener noreferrer", className="news-item")
+        for h in pool[:limit]
+    ]
+    return items or _empty("No headlines")
+
+# ── Analyst UI pieces ─────────────────────────────────────────────────────────
+RATING_COLORS = ["#16935a", "#21c07a", "#6b7385", "#f2495c", "#b4232f"]
+RATING_NAMES  = ["Strong buy", "Buy", "Hold", "Sell", "Strong sell"]
+
+
+def _rating_tone(key):
+    return {"strong_buy": "up", "buy": "up", "underperform": "down", "sell": "down"}.get(key, "flat")
+
+
+def _rating_block(r):
+    counts = r.get("ratings") or [0] * 5
+    total  = sum(counts)
+    label  = RATING_LABELS.get(r.get("recKey") or "none", "")
+    up     = r.get("upside")
+    if not total and not label:
+        return None
+    bar = html.Div([
+        html.Div(style={"width": f"{c / total * 100:.1f}%", "background": col},
+                 title=f"{name}: {c}")
+        for c, col, name in zip(counts, RATING_COLORS, RATING_NAMES) if c
+    ], className="rbar") if total else None
+    return html.Div(_kids(
+        html.Div([
+            html.Span(label or "No consensus", className=_cx("rating-label", _rating_tone(r.get("recKey")))),
+            html.Span(f"{total} analysts" if total else "", className="stat-k"),
+            html.Span(["PT ", html.B(_price(r.get("target"))), " ",
+                       html.Span(_pct(up, 1), className=_tone(up))],
+                      className="rating-pt") if _ok(r.get("target")) else None,
+        ], className="rating-line"),
+        bar,
+    ), className="rating")
+
+
+def _fmt_date(ts):
+    return time.strftime("%b %d", time.localtime(ts)).replace(" 0", " ")
+
+
+def _grade_text(a):
+    if a["from"] and a["to"] and a["from"] != a["to"]:
+        return f"{a['from']} → {a['to']}"
+    return a["to"] or a["from"] or ""
+
+
+def _pt_text(a):
+    pt, old = a.get("pt"), a.get("ptOld")
+    if pt and old and abs(pt - old) > 1e-9:
+        return f"PT {_price(old)} → {_price(pt)}"
+    return f"PT {_price(pt)}" if pt else ""
+
+
+def _action_note(a):
+    parts = [_fmt_date(a["t"]), f"{a['firm']}: {ANALYST_ACTIONS.get(a['action'], a['action'].title())}"]
+    g = _grade_text(a)
+    if g:
+        parts[-1] += f" {g}"
+    pt = _pt_text(a)
+    return " · ".join(parts + ([pt] if pt else []))
+
+
+def _action_items(actions: list, show_ticker: bool, limit=50):
+    chip = {"up": "chip-up", "down": "chip-down", "init": "chip-blue"}
+    items = []
+    for a in actions[:limit]:
+        kind = a["action"]
+        items.append(html.Div([
+            html.Div(_kids(
+                html.Span(a.get("ticker"), className="news-tk is-sel") if show_ticker else None,
+                html.Span(a["firm"], className="act-firm"),
+                html.Span(ANALYST_ACTIONS.get(kind, kind.title()),
+                          className=_cx("chip", chip.get(kind, "chip-flat"))),
+            ), className="act-top"),
+            html.Div(_kids(
+                html.Span(_grade_text(a)) if _grade_text(a) else None,
+                html.Span(_pt_text(a), className=_tone((a.get("pt") or 0) - (a.get("ptOld") or 0))
+                          if a.get("ptOld") else "") if _pt_text(a) else None,
+                html.Span(_fmt_date(a["t"])),
+            ), className="news-meta"),
+        ], className="act-item"))
+    return items or _empty("No analyst actions in this window")
 
 # ── Charts ────────────────────────────────────────────────────────────────────
 RANGE_BUTTONS = [
@@ -1145,6 +1462,41 @@ news_tab = html.Div([
     ], className="explore"),
 ])
 
+# ── Analyst tab ───────────────────────────────────────────────────────────────
+analyst_tab = html.Div([
+    dcc.Store(id="store-an-data",     data=None),
+    dcc.Store(id="store-an-selected", data=[]),
+    dcc.Store(id="store-an-xrange",   data=None),
+
+    _page_head("Analyst Coverage",
+               "Stocks drawing the most Wall Street analyst attention — rating changes, "
+               "price targets and analyst headlines", [
+        dcc.Loading(html.Div(id="an-status", className="status"), type="dot", color=ACCENT),
+        _btn("Refresh", "btn-an-refresh"),
+    ]),
+    html.Div([
+        _field("Time window", _seg("seg-an-window",
+                                   [{"label": k, "value": k} for k in ANALYST_WINDOWS], "1M")),
+        _field("Rank by", _seg("seg-an-sort", [
+            {"label": "Most coverage", "value": "coverage"},
+            {"label": "Upgrades",      "value": "upgrades"},
+            {"label": "Downgrades",    "value": "downgrades"},
+            {"label": "Target upside", "value": "upside"},
+        ], "coverage")),
+        html.Div(_btn("Clear selection", "btn-an-clear", "btn-ghost"), style={"marginLeft": "auto"}),
+    ], className="toolbar mb"),
+    html.Div(id="div-an-kpis", className="kpi-row mb"),
+    html.Div([
+        html.Div(id="div-an-bubbles", className="card-grid",
+                 children=[_empty("Loading analyst coverage…")]),
+        _compare_panel("an-", height=200, extra=_panel(
+            html.Div(id="div-an-detail"),
+            right=_seg("seg-an-detail", [{"label": "Headlines", "value": "news"},
+                                         {"label": "Analyst actions", "value": "actions"}], "news"),
+            title=html.Span(id="an-detail-title"), className="panel-grow")),
+    ], className="explore"),
+])
+
 # ── Root layout ───────────────────────────────────────────────────────────────
 app.layout = html.Div(className="app", children=[
     dcc.Store(id="store-watchlists", data=load_watchlists()),
@@ -1170,6 +1522,7 @@ app.layout = html.Div(className="app", children=[
                 ("Filter",   "tab-filter",   filter_tab),
                 ("Sectors",  "tab-sectors",  sectors_tab),
                 ("News",     "tab-news",     news_tab),
+                ("Analysts", "tab-analyst",  analyst_tab),
             ]
         ],
     ),
@@ -1291,6 +1644,7 @@ _register_rescale(["graph-normalized", "graph-price"], [True, False], "store-scr
 _register_rescale(["graph-filter-normalized", "graph-filter-price"], [True, False], "store-flt-xrange")
 _register_rescale(["graph-sector-normalized", "graph-sector-price"], [True, False], "store-sec-xrange")
 _register_rescale(["graph-news-normalized", "graph-news-price"], [True, False], "store-news-xrange")
+_register_rescale(["graph-an-normalized", "graph-an-price"], [True, False], "store-an-xrange")
 
 # ── MARKETS CALLBACKS ─────────────────────────────────────────────────────────
 def _index_card(idx, info):
@@ -1415,7 +1769,10 @@ def manage_watchlists(_, __, sel, name, ticker_input, lists):
         save_watchlists(lists)
         return lists, watchlist_options(lists), f"Deleted “{sel}”", no_update
     if "dd-watchlist" in trigger:
-        if not sel or sel == "__default__":
+        # a cleared dropdown (user cleared it, or its list was just deleted) loads nothing
+        if not sel:
+            return no_update, no_update, no_update, no_update
+        if sel == "__default__":
             return no_update, no_update, "Loaded tickers.txt", " ".join(load_tickers())
         return no_update, no_update, f"Loaded “{sel}”", " ".join(lists.get(sel, []))
     return no_update, no_update, no_update, no_update
@@ -1781,21 +2138,151 @@ def update_news_headlines(rows, selected):
                 seen.add(h["link"])
                 pool.append(h)
     pool.sort(key=lambda h: h["time"], reverse=True)
-    items = [
-        html.A([
-            html.Div(h["title"], className="news-title"),
-            html.Div([
-                html.Span(h["publisher"]), html.Span("·"), html.Span(_time_ago(h["time"])),
-                *[html.Span(t, className=_cx("news-tk", "is-sel" if t in sel else ""))
-                  for t in h["tickers"][:6]],
-            ], className="news-meta"),
-        ], href=h["link"], target="_blank", rel="noopener noreferrer", className="news-item")
-        for h in pool[:40]
+    return _headline_items(pool, sel)
+
+
+# ── ANALYST CALLBACKS ─────────────────────────────────────────────────────────
+
+def _kpi(label, value, tone=""):
+    return html.Div([html.Div(label, className="kpi-label"),
+                     html.Div(value, className=_cx("kpi-value", tone))], className="kpi")
+
+
+@app.callback(
+    Output("store-an-data", "data"),
+    Output("an-status",     "children"),
+    Output("div-an-kpis",   "children"),
+    Input("main-tabs",      "value"),
+    Input("btn-an-refresh", "n_clicks"),
+    Input("seg-an-window",  "value"),
+    Input("seg-an-sort",    "value"),
+    State("store-an-data",  "data"),
+    prevent_initial_call=True,
+)
+def load_analyst(tab, _refresh, window, sort, current):
+    trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+    if trigger.startswith("main-tabs") and (tab != "tab-analyst" or current is not None):
+        return no_update, no_update, no_update
+    force   = trigger.startswith("btn-an-refresh")
+    records = load_analyst_data(force=force)
+    if not records:
+        return [], html.Span("Couldn’t load analyst data — try Refresh", className="status-warn"), []
+    if force:
+        _ticker_news_cache.pop("__analyst__", None)
+    heads = fetch_analyst_headlines()
+    rows, tot = analyst_window(records, window or "1M", sort or "coverage", heads)
+
+    hists = get_histories_1y([r["Ticker"] for r in rows])
+    for r in rows:
+        ser = hists.get(r["Ticker"])
+        r["Spark"] = [round(float(v), 4) for v in ser.iloc[-22:]] if ser is not None else []
+        r["1M %"]  = _pct_back(ser, 21)
+
+    newest = max((h["t"] for rec in records for h in rec["history"]), default=0)
+    as_of  = time.strftime("%I:%M %p", time.localtime(_analyst["ts"])).lstrip("0")
+    status = (f"{len(records)} stocks tracked · Yahoo rating history through "
+              f"{_fmt_date(newest)} · fetched {as_of}" if newest else "")
+    kpis = [
+        _kpi("Stocks with activity", f"{tot['stocks']:,}"),
+        _kpi("Rating actions",       f"{tot['actions']:,}"),
+        _kpi("Upgrades",             f"{tot['up']:,}",   "up"),
+        _kpi("Downgrades",           f"{tot['down']:,}", "down"),
+        _kpi("Initiations",          f"{tot['init']:,}"),
+        _kpi("Analyst headlines",    f"{tot['heads']:,}"),
     ]
-    return items or _empty("No headlines")
+    return rows, status, kpis
+
+
+@app.callback(
+    Output("store-an-selected", "data"),
+    Input("btn-an-clear", "n_clicks"),
+    Input({"type": "an-bubble", "ticker": ALL}, "n_clicks"),
+    State("store-an-selected", "data"),
+    prevent_initial_call=True,
+)
+def update_an_selection(_, _clicks, selected):
+    return _toggle_from_click(selected, "btn-an-clear")
+
+
+@app.callback(
+    Output("div-an-bubbles",   "children"),
+    Input("store-an-data",     "data"),
+    Input("store-an-selected", "data"),
+)
+def update_an_bubbles(rows, selected):
+    if rows is None:
+        return [_empty("Loading analyst coverage…")]
+    if not rows:
+        return [_empty("No analyst activity in this window — try a longer one", warn=True)]
+    sel = selected or []
+    cards = []
+    for r in rows:
+        stats = [("", f"{r['n']} action{'s' if r['n'] != 1 else ''}", "")] if r["n"] else []
+        if r["ups"] or r["downs"]:
+            stats.append(("", f"▲{r['ups']} ▼{r['downs']}",
+                          "up" if r["ups"] > r["downs"] else "down" if r["downs"] > r["ups"] else ""))
+        if r["heads"]:
+            stats.append(("", f"{r['heads']} news", ""))
+        cards.append(_quote_card(
+            r["Ticker"], "an-bubble", _sel_color(r["Ticker"], sel),
+            company=r.get("Company", ""), price=r.get("Price"), change=r.get("1D %"),
+            spark=r.get("Spark"), stats=stats, extra=_rating_block(r),
+            note=_action_note(r["actions"][0]) if r["actions"] else None,
+        ))
+    return cards
+
+
+@app.callback(
+    Output("graph-an-normalized", "figure"),
+    Output("graph-an-price",      "figure"),
+    Input("store-an-selected",    "data"),
+    State("store-an-xrange",      "data"),
+    prevent_initial_call=True,
+)
+def update_an_charts(selected, xrange):
+    return _build_compare_charts(selected or [], xrange)
+
+
+@app.callback(
+    Output("div-an-detail",     "children"),
+    Output("an-detail-title",   "children"),
+    Input("store-an-selected",  "data"),
+    Input("seg-an-detail",      "value"),
+    Input("store-an-data",      "data"),
+)
+def update_an_detail(selected, mode, rows):
+    sel = selected or []
+    if mode == "actions":
+        by = {r["Ticker"]: r for r in rows or []}
+        tickers = [t for t in sel if t in by] or list(by)
+        acts = sorted(({**a, "ticker": t} for t in tickers for a in by[t]["actions"]),
+                      key=lambda a: a["t"], reverse=True)
+        title = "Analyst actions" + (f" · {', '.join(sel)}" if sel else " · latest")
+        return _action_items(acts, show_ticker=len(tickers) > 1), title
+    if sel:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            batches = list(pool.map(fetch_ticker_news, sel))
+        seen, arts = set(), []
+        for b in batches:
+            for h in b:
+                if h["link"] not in seen:
+                    seen.add(h["link"])
+                    arts.append(h)
+        arts.sort(key=lambda h: h["time"], reverse=True)
+        return _headline_items(arts, sel), f"Headlines · {', '.join(sel)}"
+    return _headline_items(fetch_analyst_headlines()), "Analyst headlines"
+
+
+def _warm_caches():
+    try:
+        load_analyst_data()
+        fetch_analyst_headlines()
+    except Exception as e:
+        print(f"Cache warm-up: {e}")
 
 
 if __name__ == "__main__":
+    threading.Thread(target=_warm_caches, daemon=True).start()
     print(f"\n  Open on this machine : http://localhost:8050")
     print(f"  Open on phone/other  : http://{LOCAL_IP}:8050\n")
     app.run(debug=False, host="0.0.0.0", port=8050)
