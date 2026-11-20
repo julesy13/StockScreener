@@ -1449,8 +1449,9 @@ def _quote_card(ticker, id_type, sel_color=None, *, company="", price=None, chan
         id={"type": id_type, "ticker": ticker},
         n_clicks=0,
         className=_cx("qcard", "is-selected" if sel_color else ""),
+        style={"--sel-color": sel_color} if sel_color else {},
         children=_kids(
-            html.Div(style={"background": sel_color}, className="qcard-swatch") if sel_color else None,
+            html.Div(className="qcard-swatch"),
             html.Div([
                 html.Div(html.Span(ticker, className="qcard-sym"), className="qcard-symrow"),
                 html.Img(src=src, className="qcard-spark") if src else None,
@@ -2416,11 +2417,11 @@ def _compare_panel(prefix, height=250, extra=None):
         _panel([
             html.Div(id=f"div-{prefix}snapshot"),
             html.Div("Change from start of view · dotted = S&P 500", className="chart-label"),
-            dcc.Graph(id=f"graph-{prefix}normalized", config={"displayModeBar": False},
+            dcc.Graph(id=f"graph-{prefix}normalized", config={"displayModeBar": False}, responsive=True,
                       style={"height": f"{height}px"},
                       figure=_empty_fig("Select stocks to compare")),
             html.Div("Price", className="chart-label", style={"marginTop": "8px"}),
-            dcc.Graph(id=f"graph-{prefix}price", config={"displayModeBar": False},
+            dcc.Graph(id=f"graph-{prefix}price", config={"displayModeBar": False}, responsive=True,
                       style={"height": f"{height}px"},
                       figure=_empty_fig("Click any card to chart it")),
         ], title="Compare", sub="Click cards to add or remove · drag a chart to zoom"),
@@ -2525,11 +2526,11 @@ filter_tab = html.Div([
                 html.Div(id="div-filter-snapshot"),
                 html.Div([
                     html.Div([html.Div("Change from start of view · dotted = S&P 500", className="chart-label"),
-                              dcc.Graph(id="graph-filter-normalized", config={"displayModeBar": False},
+                              dcc.Graph(id="graph-filter-normalized", config={"displayModeBar": False}, responsive=True,
                                         style={"height": "280px"},
                                         figure=_empty_fig("Select rows to compare"))]),
                     html.Div([html.Div("Price", className="chart-label"),
-                              dcc.Graph(id="graph-filter-price", config={"displayModeBar": False},
+                              dcc.Graph(id="graph-filter-price", config={"displayModeBar": False}, responsive=True,
                                         style={"height": "280px"},
                                         figure=_empty_fig("Tick a row to chart it"))]),
                 ], className="grid-charts"),
@@ -2910,6 +2911,36 @@ def _register_rescale(graph_ids, norm_flags, store_id):
 
 
 _register_rescale(["graph-markets-chart"], [True], "store-mkt-xrange")
+
+# Browser-side card highlighting: toggling a selection only updates className/style
+# on the existing cards instead of re-sending and re-rendering every card.
+_SELECT_JS = """
+function(selected, _children, ids) {
+    const C = __COLORS__, sel = selected || [];
+    const idx = (ids || []).map(i => sel.indexOf(i.ticker));
+    return [idx.map(k => k >= 0 ? "qcard is-selected" : "qcard"),
+            idx.map(k => k >= 0 ? {"--sel-color": C[k % C.length]} : {})];
+}
+"""
+
+
+def _register_card_select(card_type, store_id, container_id):
+    app.clientside_callback(
+        _SELECT_JS.replace("__COLORS__", json.dumps(CHART_COLORS)),
+        Output({"type": card_type, "ticker": ALL}, "className"),
+        Output({"type": card_type, "ticker": ALL}, "style"),
+        Input(store_id, "data"),
+        Input(container_id, "children"),
+        State({"type": card_type, "ticker": ALL}, "id"),
+    )
+
+
+for _t, _s, _c in (("bubble", "store-selected", "div-bubbles"),
+                   ("sector-bubble", "store-sector-selected", "div-sector-bubbles"),
+                   ("news-bubble", "store-news-selected", "div-news-bubbles"),
+                   ("an-bubble", "store-an-selected", "div-an-bubbles"),
+                   ("theme-bubble", "store-theme-selected", "div-theme-bubbles")):
+    _register_card_select(_t, _s, _c)
 _register_rescale(["graph-normalized", "graph-price"], [True, False], "store-scr-xrange")
 _register_rescale(["graph-filter-normalized", "graph-filter-price"], [True, False], "store-flt-xrange")
 _register_rescale(["graph-sector-normalized", "graph-sector-price"], [True, False], "store-sec-xrange")
@@ -3092,10 +3123,10 @@ def update_selection(_, _b, treemap_click, selected):
 @app.callback(
     Output("div-bubbles", "children"),
     Input("store-data",     "data"),
-    Input("store-selected", "data"),
     Input("dd-period",      "value"),
+    State("store-selected", "data"),
 )
-def update_bubbles(store_json, selected, period):
+def update_bubbles(store_json, period, selected):
     if not store_json:
         return [_empty("Press “Run screener” to load your watchlist")]
     df  = pd.read_json(io.StringIO(store_json), orient="records")
@@ -3309,7 +3340,7 @@ def update_sector_selection(_, _b, selected):
     Output("div-sector-bubbles",       "children"),
     Output("div-sector-metrics-table", "children"),
     Input("store-sector-data",         "data"),
-    Input("store-sector-selected",     "data"),
+    State("store-sector-selected",     "data"),
 )
 def update_sector_display(store_json, selected):
     if not store_json:
@@ -3377,7 +3408,7 @@ def update_news_selection(_, _clicks, selected):
 @app.callback(
     Output("div-news-bubbles", "children"),
     Input("store-news-data",     "data"),
-    Input("store-news-selected", "data"),
+    State("store-news-selected", "data"),
 )
 def update_news_bubbles(rows, selected):
     if rows is None:
@@ -3500,7 +3531,7 @@ def update_an_selection(_, _clicks, selected):
 @app.callback(
     Output("div-an-bubbles",   "children"),
     Input("store-an-data",     "data"),
-    Input("store-an-selected", "data"),
+    State("store-an-selected", "data"),
 )
 def update_an_bubbles(rows, selected):
     if rows is None:
@@ -3678,7 +3709,7 @@ def update_theme_selection(_, _b, selected):
     Output("theme-members-head", "children"),
     Input("store-theme-stocks",  "data"),
     Input("store-theme-name",    "data"),
-    Input("store-theme-selected", "data"),
+    State("store-theme-selected", "data"),
 )
 def update_theme_bubbles(stocks, tid, selected):
     theme = THEME_BY_ID.get(tid or "ai-compute")
