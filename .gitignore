@@ -6,3 +6,4 @@ results.csv
 venv/
 .venv/
 analyst_cache.json
+weekly_picks.json

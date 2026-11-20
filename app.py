@@ -12,6 +12,7 @@ import pandas as pd
 import requests
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots
 from dash import (Dash, dcc, html, dash_table, Input, Output, State,
                   callback_context, no_update, ALL)
 from dash.dash_table.Format import Format, Scheme, Sign, Symbol
@@ -879,6 +880,297 @@ def fetch_movers(scr_id: str, n: int = 8, min_cap: float = 2e9) -> list:
              "Volume": q.get("regularMarketVolume")} for q in out[:n]]
 
 
+# ── Deep dive: company profile, history, leadership, financials ──────────────
+WIKI_HEADERS = {"User-Agent": "StockScreener/1.0 (personal research dashboard)"}
+DIVE_TTL = 6 * 3600
+_dive_cache: dict = {}            # symbol -> (timestamp, data dict)
+
+
+def _wiki_company(company: str, ticker: str) -> dict:
+    """Wikipedia intro + History section for a company (best effort)."""
+    try:
+        s = requests.get("https://en.wikipedia.org/w/api.php", headers=WIKI_HEADERS, timeout=10,
+                         params={"action": "query", "list": "search", "format": "json",
+                                 "srsearch": f"{company} company", "srlimit": 5}).json()
+        hits = [h["title"] for h in s.get("query", {}).get("search", [])]
+    except Exception as e:
+        print(f"Wikipedia search '{company}': {e}")
+        return {}
+    # accept a hit only if it shares a distinctive word with the company name
+    stop = {"inc", "corp", "corporation", "company", "co", "ltd", "plc", "holdings", "group",
+            "the", "class", "common", "stock", "technologies", "technology", "sa", "nv", "ag"}
+    words = {w for w in re.findall(r"[a-z0-9]+", company.lower()) if w not in stop and len(w) > 1}
+    title = next((h for h in hits if words & set(re.findall(r"[a-z0-9]+", h.lower()))), None)
+    if not title:
+        return {}
+    try:
+        pp = requests.get("https://en.wikipedia.org/w/api.php", headers=WIKI_HEADERS, timeout=10,
+                          params={"action": "query", "prop": "extracts", "explaintext": 1,
+                                  "exsectionformat": "wiki", "titles": title, "redirects": 1,
+                                  "format": "json"}).json()
+        page = next(iter(pp["query"]["pages"].values()))
+    except Exception as e:
+        print(f"Wikipedia page '{title}': {e}")
+        return {}
+    text = page.get("extract", "") or ""
+    parts = re.split(r"\n(==+ [^=]+? ==+)\n", "\n" + text)
+    intro = parts[0].strip()
+    history, i = [], 1
+    while i < len(parts) - 1:
+        head, body = parts[i], parts[i + 1]
+        level = len(head) - len(head.lstrip("="))
+        name = head.strip("= ").strip()
+        if level == 2 and name.lower() in ("history", "corporate history", "background"):
+            history.append(body.strip())
+            j = i + 2       # include its subsections
+            while j < len(parts) - 1 and len(parts[j]) - len(parts[j].lstrip("=")) > 2:
+                history.append(f"## {parts[j].strip('= ').strip()}\n{parts[j + 1].strip()}")
+                j += 2
+            break
+        i += 2
+    if not history:     # no History section: use the first few content sections instead
+        skip = {"references", "external links", "see also", "notes", "further reading",
+                "bibliography", "sources"}
+        i = 1
+        while i < len(parts) - 1 and len(history) < 4:
+            name = parts[i].strip("= ").strip()
+            if name.lower() in skip:
+                break
+            if parts[i + 1].strip():
+                history.append(f"## {name}\n{parts[i + 1].strip()}")
+            i += 2
+    return {"title": page.get("title", title), "intro": intro,
+            "history": "\n\n".join(h for h in history if h),
+            "url": "https://en.wikipedia.org/wiki/" + urllib.parse.quote(page.get("title", title).replace(" ", "_"))}
+
+
+def _stmt_series(df, rows: list, max_cols: int):
+    """Statement frame (line items × periods) -> oldest→newest dict of lists."""
+    if df is None or getattr(df, "empty", True):
+        return None
+    df = df.loc[:, sorted(df.columns)]
+    if "Total Revenue" in df.index:
+        df = df.loc[:, df.loc["Total Revenue"].notna()]
+    df = df.iloc[:, -max_cols:]
+    out = {"periods": [pd.Timestamp(c).strftime("%Y-%m-%d") for c in df.columns]}
+    for r in rows:
+        if r in df.index:
+            out[r] = [None if v != v else float(v) for v in df.loc[r].tolist()]
+    return out
+
+
+INCOME_ROWS = ["Total Revenue", "Gross Profit", "Operating Income", "Net Income",
+               "Diluted EPS", "Research And Development"]
+CASH_ROWS   = ["Operating Cash Flow", "Capital Expenditure", "Free Cash Flow",
+               "Repurchase Of Capital Stock", "Cash Dividends Paid"]
+
+
+def build_deep_dive(sym: str) -> dict | None:
+    sym = sym.upper().strip()
+    hit = _dive_cache.get(sym)
+    if hit and time.time() - hit[0] < DIVE_TTL:
+        return hit[1]
+    quotes = _yahoo.get_quotes([sym])
+    q = quotes[0] if quotes else None
+    if not q or q.get("regularMarketPrice") is None:
+        return None
+    company = q.get("longName") or q.get("shortName") or sym
+    tk = yf.Ticker(sym)
+
+    def summary():
+        try:
+            d = _yahoo.get_json(f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}",
+                                {"modules": "assetProfile,secFilings,earningsHistory,earningsTrend"})
+            return (d.get("quoteSummary", {}).get("result") or [None])[0] or {}
+        except Exception as e:
+            print(f"Deep dive summary '{sym}': {e}")
+            return {}
+
+    def statements():
+        out = {}
+        for key, attr, rows, n in (("q_income", "quarterly_income_stmt", INCOME_ROWS, 8),
+                                   ("a_income", "income_stmt", INCOME_ROWS, 5),
+                                   ("a_cash", "cashflow", CASH_ROWS, 5),
+                                   ("q_cash", "quarterly_cashflow", CASH_ROWS, 8)):
+            try:
+                out[key] = _stmt_series(getattr(tk, attr), rows, n)
+            except Exception as e:
+                print(f"Statements {attr} '{sym}': {e}")
+        return out
+
+    def officers():
+        for attempt in range(2):        # yfinance's crumb occasionally 401s once
+            try:
+                offs = yf.Ticker(sym).info.get("companyOfficers") or []
+                if offs:
+                    return offs
+            except Exception:
+                pass
+            time.sleep(0.8)
+        return []
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        f_sum, f_st = pool.submit(summary), pool.submit(statements)
+        f_off, f_wiki = pool.submit(officers), pool.submit(_wiki_company, company, sym)
+        f_fund = pool.submit(fetch_fundamentals, [sym])
+        res, stmts, offs, wiki = f_sum.result(), f_st.result(), f_off.result(), f_wiki.result()
+        fund = (f_fund.result() or [{}])[0]
+
+    ap = res.get("assetProfile") or {}
+    offs = offs or ap.get("companyOfficers") or []
+    filings = [{"type": f.get("type"), "date": f.get("date"), "title": f.get("title"),
+                "url": f.get("edgarUrl")}
+               for f in (res.get("secFilings") or {}).get("filings", [])]
+    eh = [{"quarter": _raw(h.get("quarter")), "actual": _raw(h.get("epsActual")),
+           "estimate": _raw(h.get("epsEstimate")), "surprise": _pct_or_none(_raw(h.get("surprisePercent")))}
+          for h in (res.get("earningsHistory") or {}).get("history", [])]
+    trend = [{"period": t.get("period"), "end": t.get("endDate"),
+              "eps": _raw((t.get("earningsEstimate") or {}).get("avg")),
+              "rev": _raw((t.get("revenueEstimate") or {}).get("avg")),
+              "growth": _pct_or_none(_raw(t.get("growth")))}
+             for t in (res.get("earningsTrend") or {}).get("trend", [])
+             if t.get("period") in ("0q", "+1q", "0y", "+1y")]
+    data = {
+        "ticker": sym, "company": company,
+        "price": q.get("regularMarketPrice"), "change": q.get("regularMarketChangePercent"),
+        "marketCap": q.get("marketCap"),
+        "summary": ap.get("longBusinessSummary", ""),
+        "sector": ap.get("sector"), "industry": ap.get("industry"),
+        "hq": ", ".join(x for x in (ap.get("city"), ap.get("state"), ap.get("country")) if x),
+        "employees": ap.get("fullTimeEmployees"), "website": ap.get("website"),
+        "officers": [{"name": re.sub(r"\s+", " ", o.get("name", "")).strip(), "title": o.get("title", ""),
+                      "age": o.get("age"), "pay": _raw(o.get("totalPay"))} for o in offs[:10]],
+        "filings": filings, "eps_history": eh, "eps_trend": trend,
+        "wiki": wiki, "fund": fund, **stmts,
+    }
+    _dive_cache[sym] = (time.time(), data)
+    return data
+
+
+# ── Weekly picks: 10 companies to research each week ─────────────────────────
+PICKS_FILE    = os.path.join(SCRIPT_DIR, "weekly_picks.json")
+PICK_BUCKETS  = [("themes", "From your themes", 4), ("quality", "Quality growth", 3),
+                 ("attention", "Rising attention", 3)]
+PICK_COOLDOWN = 8                  # weeks before a company can be picked again
+_picks_lock   = threading.Lock()
+
+
+def _week_key(ts=None):
+    """ISO week label like '2026-W47' (sorts chronologically as a string)."""
+    d = pd.Timestamp.fromtimestamp(ts) if ts else pd.Timestamp.now()
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _load_picks_file() -> dict:
+    try:
+        with open(PICKS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _pct_rank(values: dict) -> dict:
+    """Percentile rank (0-1) of each key's value; missing values -> 0.5."""
+    valid = sorted(v for v in values.values() if _ok(v))
+    if not valid:
+        return {k: 0.5 for k in values}
+    n = len(valid)
+    return {k: (sum(x <= v for x in valid) / n if _ok(v) else 0.5) for k, v in values.items()}
+
+
+def build_weekly_picks(force: bool = False) -> dict:
+    """This week's 10 picks; generated once per ISO week and saved to disk."""
+    with _picks_lock:
+        week = _week_key()
+        store = _load_picks_file()
+        if not force and week in store and store[week].get("picks"):
+            return store[week]
+
+        recent = {p["ticker"] for wk, v in store.items()
+                  if wk != week and wk >= _week_key(time.time() - PICK_COOLDOWN * 7 * 86400)
+                  for p in v.get("picks", [])}
+        mine = set(_my_tickers())
+        theme_of = {m: name for _id, name, _d, ms in THEMES for m in ms}
+
+        # analyst attention over the last 30 days
+        records = load_analyst_data()
+        cutoff = time.time() - 30 * 86400
+        attn, upgr = {}, {}
+        for rec in records:
+            acts = [h for h in rec["history"] if h["t"] >= cutoff]
+            ups = sum(a["action"] == "up" for a in acts)
+            downs = sum(a["action"] == "down" for a in acts)
+            attn[rec["Ticker"]] = len(acts) + 2 * ups - 2 * downs
+            upgr[rec["Ticker"]] = (ups, downs, len(acts))
+        top_attn = sorted(attn, key=lambda s: -attn[s])[:150]
+        pool = [s for s in dict.fromkeys(list(theme_of) + top_attn)
+                if s not in mine and s not in recent and _is_us_stock_symbol(s)]
+        rows = {r["Ticker"]: r for r in fetch_fundamentals(pool)}
+        if not rows:
+            return store.get(week, {"week": week, "picks": []})
+
+        f = lambda col: _pct_rank({s: r.get(col) for s, r in rows.items()})
+        growth, gm, om = f("Rev Growth %"), f("Gross Margin %"), f("Op Margin %")
+        mom, ups = f("3M %"), f("Upside %")
+        att = _pct_rank({s: attn.get(s) for s in rows})
+        fcf = {s: 1.0 if _ok(r.get("FCF")) and r["FCF"] > 0 else 0.0 for s, r in rows.items()}
+        quality = {s: (gm[s] + om[s] + fcf[s]) / 3 for s in rows}
+
+        scores = {
+            "themes":    {s: .30 * growth[s] + .25 * quality[s] + .20 * mom[s] + .15 * att[s] + .10 * ups[s]
+                          for s in rows if s in theme_of},
+            "quality":   {s: .45 * growth[s] + .45 * quality[s] + .10 * ups[s]
+                          for s, r in rows.items()
+                          if _ok(r.get("Rev Growth %")) and r["Rev Growth %"] > 10
+                          and _ok(r.get("Op Margin %")) and r["Op Margin %"] > 0 and fcf[s]},
+            "attention": {s: .60 * att[s] + .25 * mom[s] + .15 * ups[s]
+                          for s in rows if attn.get(s, 0) > 0},
+        }
+
+        def reason(s, bucket):
+            r, bits = rows[s], []
+            if bucket == "themes":
+                bits.append(f"In {theme_of[s]}")
+            if _ok(r.get("Rev Growth %")):
+                bits.append(f"revenue {r['Rev Growth %']:+.0f}% YoY")
+            if bucket == "quality" and _ok(r.get("Op Margin %")):
+                bits.append(f"{r['Op Margin %']:.0f}% op margin")
+            u, d, n = upgr.get(s, (0, 0, 0))
+            if bucket == "attention" and n:
+                bits.append(f"{n} analyst actions in 30d" + (f" ({u} upgrades)" if u else ""))
+            if _ok(r.get("3M %")) and bucket != "quality":
+                bits.append(f"{r['3M %']:+.0f}% over 3M")
+            if _ok(r.get("Upside %")):
+                bits.append(f"{r['Upside %']:+.0f}% to target")
+            return " · ".join(bits[:4])
+
+        picks, used, per_sector = [], set(), {}
+        for bucket, label, n in PICK_BUCKETS:
+            for s in sorted(scores[bucket], key=lambda s: -scores[bucket][s]):
+                if sum(p["bucket"] == bucket for p in picks) >= n:
+                    break
+                sec = rows[s].get("Sector") or "?"
+                if s in used or per_sector.get(sec, 0) >= 3:
+                    continue
+                used.add(s)
+                per_sector[sec] = per_sector.get(sec, 0) + 1
+                picks.append({"ticker": s, "company": rows[s].get("Company", ""),
+                              "bucket": bucket, "label": label,
+                              "score": round(scores[bucket][s], 3), "reason": reason(s, bucket),
+                              "sector": rows[s].get("Sector")})
+        entry = {"week": week, "generated": time.time(), "picks": picks}
+        store[week] = entry
+        # keep the last ~6 months of history
+        store = dict(sorted(store.items())[-26:])
+        try:
+            with open(PICKS_FILE, "w") as fh:
+                json.dump(store, fh, indent=1)
+        except Exception as e:
+            print(f"Picks write: {e}")
+        return entry
+
+
 def analyst_window(records: list, window: str, sort: str, headlines: list | None = None):
     """Rank stocks by analyst attention within the window: dated rating/price-target
     actions (Yahoo) plus analyst-related headlines. Returns (rows, totals)."""
@@ -997,7 +1289,7 @@ def _panel(children, title=None, sub=None, right=None, className="", **kw):
     if title is not None or right is not None:
         head = html.Div([
             html.Div(_kids(html.Div(title, className="panel-title") if title is not None else None,
-                           html.Div(sub, className="panel-sub") if sub else None)),
+                           html.Div(sub, className="panel-sub") if sub is not None else None)),
             html.Div(right) if right is not None else None,
         ], className="panel-head")
     body = children if isinstance(children, list) else [children]
@@ -1109,6 +1401,286 @@ def _headline_items(pool: list, sel=(), limit=40):
         for h in pool[:limit]
     ]
     return items or _empty("No headlines")
+
+# ── Deep dive UI pieces ───────────────────────────────────────────────────────
+def _period_label(p: str, annual: bool) -> str:
+    d = pd.Timestamp(p)
+    return f"FY{d.year}" if annual else f"{d.strftime('%b')} '{d.strftime('%y')}"
+
+
+def _margin_pct(num, den):
+    return num / den * 100 if _ok(num) and _ok(den) and den else None
+
+
+def _drivers(d: dict) -> list:
+    """Plain-language 'what's driving results' bullets from the numbers."""
+    out = []
+    ai, ac = d.get("a_income") or {}, d.get("a_cash") or {}
+    per = ai.get("periods", [])
+    rev = ai.get("Total Revenue", [])
+    pairs = [(p, v) for p, v in zip(per, rev) if _ok(v) and v > 0]
+    if len(pairs) >= 2:
+        (p0, v0), (p1, v1) = pairs[0], pairs[-1]
+        yrs = max(1, len(pairs) - 1)
+        cagr = ((v1 / v0) ** (1 / yrs) - 1) * 100
+        out.append(("up" if cagr > 0 else "down",
+                    f"Revenue went from {_large(v0)} (FY{p0[:4]}) to {_large(v1)} (FY{p1[:4]}) — "
+                    f"{cagr:+.0f}% a year" + (f", {v1 / v0:.1f}× in {yrs} years." if v1 / v0 >= 2 else ".")))
+    elif rev and not any(_ok(v) and v > 0 for v in rev):
+        out.append(("flat", "Pre-revenue: no sales reported yet — the investment case rests on "
+                            "technology, licensing and its commercial roadmap."))
+
+    def first_last_margin(row):
+        ms = [_margin_pct(n, r) for n, r in zip(ai.get(row, []), rev)]
+        ms = [(p, m) for p, m in zip(per, ms) if m is not None and abs(m) < 1000]
+        return (ms[0], ms[-1]) if len(ms) >= 2 else (None, ms[-1] if ms else None)
+
+    first, last = first_last_margin("Gross Profit")
+    if first and last and abs(last[1] - first[1]) >= 2:
+        verb = "expanded" if last[1] > first[1] else "compressed"
+        out.append(("up" if verb == "expanded" else "down",
+                    f"Gross margin {verb} from {first[1]:.0f}% (FY{first[0][:4]}) "
+                    f"to {last[1]:.0f}% (FY{last[0][:4]})."))
+    _f, last = first_last_margin("Operating Income")
+    if last:
+        out.append(("up" if last[1] > 0 else "down",
+                    f"Operating margin of {last[1]:.0f}% in FY{last[0][:4]}." if last[1] > 0 else
+                    f"Still loss-making at the operating line ({last[1]:.0f}% margin in FY{last[0][:4]})."))
+    rd, r_last = (ai.get("Research And Development") or [None])[-1], (rev or [None])[-1]
+    rd_pct = _margin_pct(rd, r_last)
+    if rd_pct and 3 <= rd_pct < 1000:
+        out.append(("flat", f"Reinvests {rd_pct:.0f}% of revenue in R&D."))
+    fcf = [v for v in ac.get("Free Cash Flow", []) if _ok(v)]
+    if fcf:
+        f_last = fcf[-1]
+        pct = _margin_pct(f_last, r_last)
+        out.append(("up" if f_last > 0 else "down",
+                    f"Generated {_large(f_last)} of free cash flow last fiscal year"
+                    + (f" ({pct:.0f}% of revenue)." if pct and 0 < pct < 200 else ".")
+                    if f_last > 0 else f"Burned {_large(-f_last)} of free cash flow last fiscal year."))
+    bb = [v for v in ac.get("Repurchase Of Capital Stock", []) if _ok(v)]
+    if bb and bb[-1] < -1e8:
+        out.append(("up", f"Returned {_large(-bb[-1])} to shareholders through buybacks last year."))
+    eh = [h for h in d.get("eps_history", []) if _ok(h.get("actual")) and _ok(h.get("estimate"))]
+    if eh:
+        beats = sum(h["actual"] >= h["estimate"] for h in eh)
+        surp = [h["surprise"] for h in eh if _ok(h.get("surprise"))]
+        out.append(("up" if beats >= len(eh) / 2 else "down",
+                    f"Beat EPS estimates in {beats} of the last {len(eh)} quarters"
+                    + (f" (average surprise {sum(surp) / len(surp):+.1f}%)." if surp else ".")))
+    nxt = next((t for t in d.get("eps_trend", []) if t["period"] == "+1y"), None)
+    cur = next((t for t in d.get("eps_trend", []) if t["period"] == "0y"), None)
+    if nxt and _ok(nxt.get("eps")) and nxt["eps"] < 0:
+        # growth % is misleading for losses — state the expected loss instead
+        out.append(("down", f"Analysts expect a loss of ${-nxt['eps']:.2f}/share next fiscal year"
+                            + (f" (vs ${-cur['eps']:.2f} this year)." if cur and _ok(cur.get("eps"))
+                               and cur["eps"] < 0 else ".")))
+    elif nxt and _ok(nxt.get("growth")):
+        out.append(("up" if nxt["growth"] > 0 else "down",
+                    f"Analysts expect EPS {nxt['growth']:+.0f}% next fiscal year (FY ending {nxt['end'][:7]})."))
+    fund = d.get("fund") or {}
+    cash, debt = fund.get("Cash"), fund.get("Debt")
+    if _ok(cash) and _ok(debt):
+        net = cash - debt
+        out.append(("up" if net > 0 else "flat",
+                    f"Net cash of {_large(net)} on the balance sheet." if net > 0 else
+                    f"Net debt of {_large(-net)} on the balance sheet."))
+    return out
+
+
+def _money_scale(*series):
+    """Pick a $B/$M unit for chart axes from the largest absolute value."""
+    vals = [abs(v) for s in series for v in (s or []) if _ok(v)]
+    big = max(vals) if vals else 0
+    return (1e9, "B") if big >= 1e9 else (1e6, "M") if big >= 1e6 else (1e3, "K")
+
+
+def _scaled(vals, div):
+    return [v / div if _ok(v) else None for v in (vals or [])]
+
+
+def _fin_fig(st: dict, annual: bool):
+    """Revenue & net income bars with operating-margin line."""
+    if not st or not st.get("Total Revenue"):
+        return _empty_fig("No income statement data")
+    x = [_period_label(p, annual) for p in st["periods"]]
+    rev, ni = st.get("Total Revenue", []), st.get("Net Income", [None] * len(x))
+    om = [_margin_pct(o, r) for o, r in zip(st.get("Operating Income", [None] * len(x)), rev)]
+    om = [m if m is not None and abs(m) < 500 else None for m in om]
+    div, unit = _money_scale(rev, ni)
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(x=x, y=_scaled(rev, div), name="Revenue", marker=dict(color=ACCENT, cornerradius=3),
+                         hovertemplate="Revenue  <b>%{customdata}</b><extra></extra>",
+                         customdata=[_large(v) for v in rev]), secondary_y=False)
+    fig.add_trace(go.Bar(x=x, y=_scaled(ni, div), name="Net income",
+                         marker=dict(color=[GREEN if (v or 0) >= 0 else RED for v in ni], cornerradius=3),
+                         hovertemplate="Net income  <b>%{customdata}</b><extra></extra>",
+                         customdata=[_large(v) if _ok(v) and v >= 0 else
+                                     ("−" + _large(-v) if _ok(v) else "—") for v in ni]),
+                  secondary_y=False)
+    if any(m is not None for m in om):
+        fig.add_trace(go.Scatter(x=x, y=om, name="Operating margin", mode="lines+markers",
+                                 line=dict(color=AMBER, width=2), marker=dict(size=6),
+                                 hovertemplate="Op margin  <b>%{y:.1f}%</b><extra></extra>"),
+                      secondary_y=True)
+    _style_fig(fig, top=30)
+    fig.update_layout(barmode="group", bargap=0.3, hovermode="x unified")
+    fig.update_xaxes(showspikes=False, type="category")
+    fig.update_yaxes(side="left", tickprefix="$", ticksuffix=unit, tickformat=",.0f",
+                     secondary_y=False)
+    fig.update_yaxes(side="right", ticksuffix="%", showgrid=False, secondary_y=True,
+                     tickfont=dict(size=10.5, color=AMBER))
+    return fig
+
+
+def _eps_fig(d: dict):
+    hist = [h for h in d.get("eps_history", []) if _ok(h.get("quarter"))]
+    fut  = [t for t in d.get("eps_trend", []) if t["period"] in ("0q", "+1q") and _ok(t.get("eps"))]
+    if not hist and not fut:
+        return _empty_fig("No EPS data")
+    lab = lambda ts: "Q " + pd.Timestamp(ts, unit="s").strftime("%b '%y")
+    fig = go.Figure()
+    xs = [lab(h["quarter"]) for h in hist]
+    fig.add_trace(go.Bar(
+        x=xs, y=[h["actual"] for h in hist], name="Reported EPS",
+        marker=dict(color=[GREEN if _ok(h["actual"]) and _ok(h["estimate"]) and h["actual"] >= h["estimate"]
+                           else RED for h in hist], cornerradius=3),
+        customdata=[f"{h['surprise']:+.1f}%" if _ok(h.get("surprise")) else "—" for h in hist],
+        hovertemplate="Reported  <b>$%{y:.2f}</b>  surprise %{customdata}<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=xs + ["Est. " + pd.Timestamp(t["end"]).strftime("%b '%y") for t in fut],
+        y=[h["estimate"] for h in hist] + [t["eps"] for t in fut],
+        name="Consensus estimate", mode="markers",
+        marker=dict(symbol="diamond", size=10, color=SURFACE, line=dict(color=TEXT, width=1.5)),
+        hovertemplate="Estimate  <b>$%{y:.2f}</b><extra></extra>"))
+    if fut:
+        fig.add_trace(go.Bar(
+            x=["Est. " + pd.Timestamp(t["end"]).strftime("%b '%y") for t in fut], y=[t["eps"] for t in fut],
+            name="Next quarters (est.)", marker=dict(color="rgba(79,140,255,0.25)",
+                                                     line=dict(color=ACCENT, width=1), cornerradius=3),
+            hoverinfo="skip"))
+    _style_fig(fig, top=30)
+    fig.update_layout(bargap=0.35, hovermode="x unified")
+    fig.update_xaxes(showspikes=False, type="category")
+    fig.update_yaxes(tickprefix="$", side="left")
+    return fig
+
+
+def _cash_fig(st: dict, annual: bool):
+    if not st or not st.get("periods"):
+        return _empty_fig("No cash-flow data")
+    x = [_period_label(p, annual) for p in st["periods"]]
+    div, unit = _money_scale(*(st.get(r) for r in ("Operating Cash Flow", "Capital Expenditure",
+                                                    "Free Cash Flow")))
+    fig = go.Figure()
+    for row, name, color in (("Operating Cash Flow", "Operating cash flow", "#60a5fa"),
+                             ("Capital Expenditure", "Capex", "#6b7385")):
+        if st.get(row):
+            fig.add_trace(go.Bar(x=x, y=_scaled(st[row], div), name=name, marker=dict(color=color, cornerradius=3),
+                                 customdata=[_large(abs(v)) if _ok(v) else "—" for v in st[row]],
+                                 hovertemplate=f"{name}  <b>%{{customdata}}</b><extra></extra>"))
+    if st.get("Free Cash Flow"):
+        fig.add_trace(go.Scatter(x=x, y=_scaled(st["Free Cash Flow"], div), name="Free cash flow",
+                                 mode="lines+markers", line=dict(color=GREEN, width=2.5),
+                                 marker=dict(size=7),
+                                 customdata=[(_large(v) if v >= 0 else "−" + _large(-v)) if _ok(v) else "—"
+                                             for v in st["Free Cash Flow"]],
+                                 hovertemplate="FCF  <b>%{customdata}</b><extra></extra>"))
+    _style_fig(fig, top=30)
+    fig.update_layout(barmode="group", bargap=0.3, hovermode="x unified")
+    fig.update_xaxes(showspikes=False, type="category")
+    fig.update_yaxes(tickprefix="$", ticksuffix=unit, tickformat=",.0f", side="left")
+    return fig
+
+
+def _fin_table(st: dict, annual: bool):
+    if not st or not st.get("periods"):
+        return None
+    labels = [_period_label(p, annual) for p in st["periods"]]
+    lines = [("Total Revenue", "Revenue"), ("Gross Profit", "Gross profit"),
+             ("Operating Income", "Operating income"), ("Net Income", "Net income"),
+             ("Research And Development", "R&D"), ("Diluted EPS", "Diluted EPS")]
+    head = html.Tr([html.Th("")] + [html.Th(l) for l in labels])
+    body = []
+    rev = st.get("Total Revenue") or []
+    for key, name in lines:
+        vals = st.get(key)
+        if not vals or not any(_ok(v) for v in vals):
+            continue
+        fmt = (lambda v: f"${v:.2f}" if _ok(v) else "—") if key == "Diluted EPS" else \
+              (lambda v: (_large(v) if v >= 0 else "−" + _large(-v)) if _ok(v) else "—")
+        body.append(html.Tr([html.Td(name)] + [html.Td(fmt(v), className=_tone(v) if key == "Net Income" else "")
+                                                for v in vals]))
+        if key == "Total Revenue" and len(vals) > 1:
+            lag = 1 if annual else 4      # YoY for quarters needs 4 periods back
+            g = [((vals[i] / vals[i - lag] - 1) * 100 if i >= lag and _ok(vals[i]) and _ok(vals[i - lag])
+                  and vals[i - lag] else None) for i in range(len(vals))]
+            body.append(html.Tr([html.Td("  Growth YoY", className="sub")] +
+                                [html.Td(_pct(v, 0) if v is not None and abs(v) < 1e4 else "—",
+                                         className=_cx("sub", _tone(v))) for v in g]))
+        if key in ("Gross Profit", "Operating Income", "Net Income"):
+            m = [_margin_pct(a, b) for a, b in zip(vals, rev)]
+            body.append(html.Tr([html.Td("  Margin", className="sub")] +
+                                [html.Td(f"{v:.1f}%" if v is not None and abs(v) < 1000 else "n/m"
+                                         if v is not None else "—", className="sub") for v in m]))
+    return html.Div(html.Table([html.Thead(head), html.Tbody(body)], className="fin-table"),
+                    className="fin-table-wrap")
+
+
+def _history_block(wiki: dict):
+    if not wiki or not (wiki.get("intro") or wiki.get("history")):
+        return _empty("No encyclopedia entry found for this company")
+    def paras(text):
+        out = []
+        for chunk in [c.strip() for c in text.split("\n") if c.strip()]:
+            if chunk.startswith("## "):
+                out.append(html.H4(chunk[3:], className="hist-h"))
+            else:
+                out.append(html.P(chunk))
+        return out
+    hist = paras(wiki.get("history", ""))
+    shown, rest = hist[:5], hist[5:]
+    return html.Div(_kids(
+        html.Div(paras(wiki.get("intro", "")), className="hist-intro"),
+        html.Div(shown, className="hist-body") if shown else None,
+        html.Details([html.Summary(f"Read the full history ({len(rest)} more sections & paragraphs)"),
+                      html.Div(rest, className="hist-body")], className="hist-more") if rest else None,
+        html.Div(["Source: ", html.A(f"Wikipedia — {wiki.get('title')}", href=wiki.get("url"),
+                                     target="_blank", rel="noopener noreferrer"),
+                  " · text available under CC BY-SA 4.0"], className="field-hint"),
+    ), className="history")
+
+
+def _leaders_block(officers: list):
+    if not officers:
+        return _empty("Leadership data unavailable")
+    return html.Div([
+        html.Div([
+            html.Div([html.Div(o["name"], className="lead-name"),
+                      html.Div(o["title"], className="lead-title")]),
+            html.Div(_kids(html.Span(f"Age {o['age']}") if o.get("age") else None,
+                           html.Span(f"Pay {_large(o['pay'])}") if _ok(o.get("pay")) and o["pay"] else None),
+                     className="lead-meta"),
+        ], className="lead-row") for o in officers
+    ])
+
+
+def _filings_block(filings: list):
+    if not filings:
+        return _empty("No filings found")
+    periodic = [f for f in filings if (f.get("type") or "").startswith(("10-K", "10-Q", "20-F", "40-F"))]
+    other    = [f for f in filings if f not in periodic]
+    row = lambda f: html.A([
+        html.Span(f.get("type"), className=_cx("chip", "chip-blue" if f in periodic else "chip-flat")),
+        html.Span(f.get("title") or "", className="filing-title"),
+        html.Span(f.get("date") or "", className="filing-date"),
+    ], href=f.get("url"), target="_blank", rel="noopener noreferrer", className="filing-row")
+    return html.Div(_kids(
+        html.Div("Quarterly & annual reports", className="filter-group-title"),
+        html.Div([row(f) for f in periodic[:12]] or [_empty("None listed")]),
+        html.Details([html.Summary(f"Other filings ({len(other)})"),
+                      html.Div([row(f) for f in other[:25]])], className="hist-more") if other else None,
+    ))
 
 # ── Analyst UI pieces ─────────────────────────────────────────────────────────
 RATING_COLORS = ["#16935a", "#21c07a", "#6b7385", "#f2495c", "#b4232f"]
@@ -1898,6 +2470,70 @@ themes_tab = html.Div([
     ], className="explore"),
 ])
 
+# ── Deep Dive tab ─────────────────────────────────────────────────────────────
+deep_tab = html.Div([
+    dcc.Store(id="store-picks",       data=None),
+    dcc.Store(id="store-dive-ticker", data=None, storage_type="local"),
+    dcc.Store(id="store-dive-data",   data=None),
+    dcc.Store(id="store-dive-xrange", data=None),
+
+    _page_head("Deep Dive", "Company history, leadership and financial trends", [
+        dcc.Loading(html.Div(id="dive-status", className="status"), type="dot", color=ACCENT),
+        html.Div([dcc.Input(id="dive-input", type="text", className="inp", placeholder="Any ticker…",
+                            debounce=False, n_submit=0, style={"width": "140px"}),
+                  _btn("Dive in", "btn-dive-go", "btn-primary")],
+                 style={"display": "flex", "gap": "6px"}),
+    ]),
+
+    _panel(html.Div(id="div-picks", className="picks-grid",
+                    children=[_empty("Building this week’s picks…")]),
+           title="This week’s 10",
+           sub=html.Span(id="picks-sub"),
+           right=html.Div([dcc.Loading(html.Div(id="picks-status", className="status"),
+                                       type="dot", color=ACCENT),
+                           _btn("Regenerate", "btn-picks-regen", "btn-ghost")],
+                          style={"display": "flex", "gap": "8px", "alignItems": "center"}),
+           className="mb"),
+
+    html.Div(id="dive-wrap", className="hidden", children=[
+        html.Div(id="dive-header", className="dive-header"),
+        html.Div([
+            html.Div([
+                _panel(html.Div(id="dive-about", className="about"), title="What they do"),
+                _panel(html.Div(id="dive-drivers"), title="What’s driving results",
+                       sub="Derived from reported financials, earnings history and consensus estimates"),
+                _panel([
+                    html.Div("Revenue, net income & operating margin", className="chart-label"),
+                    dcc.Graph(id="graph-dive-fin", config={"displayModeBar": False}, responsive=True,
+                              style={"height": "300px"}, figure=_empty_fig("")),
+                    html.Div(id="dive-fin-table"),
+                    html.Div([
+                        html.Div([html.Div("Earnings per share — reported vs. consensus",
+                                           className="chart-label"),
+                                  dcc.Graph(id="graph-dive-eps", config={"displayModeBar": False}, responsive=True,
+                                            style={"height": "250px"}, figure=_empty_fig(""))]),
+                        html.Div([html.Div("Cash flow", className="chart-label"),
+                                  dcc.Graph(id="graph-dive-cash", config={"displayModeBar": False}, responsive=True,
+                                            style={"height": "250px"}, figure=_empty_fig(""))]),
+                    ], className="grid-charts", style={"marginTop": "14px"}),
+                ], title="Financial trends",
+                   right=_seg("seg-dive-period", [{"label": "Quarterly", "value": "q"},
+                                                  {"label": "Annual", "value": "a"}], "a")),
+                _panel(html.Div(id="dive-history"), title="History & background"),
+            ], className="dive-main"),
+            html.Div([
+                _panel([html.Div(id="dive-snapshot"),
+                        html.Div("Price · 1 year", className="chart-label"),
+                        dcc.Graph(id="graph-dive-price", config={"displayModeBar": False}, responsive=True,
+                                  style={"height": "220px"}, figure=_empty_fig(""))],
+                       title="Snapshot"),
+                _panel(html.Div(id="dive-leaders"), title="Leadership"),
+                _panel(html.Div(id="dive-filings"), title="SEC filings"),
+            ], className="dive-side"),
+        ], className="dive-grid"),
+    ]),
+])
+
 # ── Root layout ───────────────────────────────────────────────────────────────
 app.layout = html.Div(className="app", children=[
     dcc.Store(id="store-watchlists", data=load_watchlists()),
@@ -1925,6 +2561,7 @@ app.layout = html.Div(className="app", children=[
                 ("Sectors",  "tab-sectors",  sectors_tab),
                 ("News",     "tab-news",     news_tab),
                 ("Analysts", "tab-analyst",  analyst_tab),
+                ("Deep Dive", "tab-deep",    deep_tab),
             ]
         ],
     ),
@@ -2048,6 +2685,7 @@ _register_rescale(["graph-sector-normalized", "graph-sector-price"], [True, Fals
 _register_rescale(["graph-news-normalized", "graph-news-price"], [True, False], "store-news-xrange")
 _register_rescale(["graph-an-normalized", "graph-an-price"], [True, False], "store-an-xrange")
 _register_rescale(["graph-themes-chart"], [True], "store-themechart-xrange")
+_register_rescale(["graph-dive-price"], [False], "store-dive-xrange")
 _register_rescale(["graph-theme-normalized", "graph-theme-price"], [True, False], "store-theme-xrange")
 
 # ── MARKETS CALLBACKS ─────────────────────────────────────────────────────────
@@ -2853,10 +3491,181 @@ def update_theme_charts(selected, xrange):
     return _compare_outputs(selected, xrange)
 
 
+# ── DEEP DIVE CALLBACKS ──────────────────────────────────────────────────────
+PICK_BADGE = {"themes": "badge-blue", "quality": "badge-green", "attention": "badge-hot"}
+
+
+@app.callback(
+    Output("store-picks",  "data"),
+    Output("picks-status", "children"),
+    Output("picks-sub",    "children"),
+    Output("store-dive-ticker", "data", allow_duplicate=True),
+    Input("main-tabs",       "value"),
+    Input("btn-picks-regen", "n_clicks"),
+    State("store-picks",       "data"),
+    State("store-dive-ticker", "data"),
+    prevent_initial_call=True,
+)
+def load_picks(tab, _regen, current, dive_ticker):
+    trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+    if trigger.startswith("main-tabs") and (tab != "tab-deep" or current):
+        return no_update, no_update, no_update, no_update
+    entry = build_weekly_picks(force=trigger.startswith("btn-picks-regen"))
+    picks = entry.get("picks", [])
+    if not picks:
+        return no_update, html.Span("Couldn’t build picks — try Regenerate", className="status-warn"), "", no_update
+    monday = pd.Timestamp.now().normalize() - pd.Timedelta(days=pd.Timestamp.now().weekday())
+    counts = {b: sum(p["bucket"] == b for p in picks) for b, *_ in PICK_BUCKETS}
+    sub = (f"Week of {monday.strftime('%b %d').replace(' 0', ' ')} · "
+           f"{counts['themes']} from your themes, {counts['quality']} quality growth, "
+           f"{counts['attention']} rising attention · new list every Monday, "
+           f"no repeats for {PICK_COOLDOWN} weeks")
+    first = no_update if dive_ticker else picks[0]["ticker"]
+    return entry, f"{len(picks)} picks", sub, first
+
+
+@app.callback(
+    Output("div-picks", "children"),
+    Input("store-picks",       "data"),
+    Input("store-dive-ticker", "data"),
+)
+def render_picks(entry, active):
+    if not entry:
+        return no_update
+    return [html.Div(
+        id={"type": "pick-card", "ticker": p["ticker"]}, n_clicks=0,
+        className=_cx("pick-card", "is-selected" if p["ticker"] == active else ""),
+        children=[
+            html.Div([html.Span(p["ticker"], className="qcard-sym"),
+                      html.Span(p["label"], className=_cx("badge", PICK_BADGE.get(p["bucket"], "")))],
+                     className="qcard-top"),
+            html.Div(p.get("company", ""), className="qcard-name"),
+            html.Div(p.get("reason", ""), className="pick-reason"),
+        ]) for p in entry.get("picks", [])]
+
+
+@app.callback(
+    Output("store-dive-ticker", "data"),
+    Input({"type": "pick-card", "ticker": ALL}, "n_clicks"),
+    Input("btn-dive-go", "n_clicks"),
+    Input("dive-input",  "n_submit"),
+    State("dive-input",  "value"),
+    prevent_initial_call=True,
+)
+def choose_dive_ticker(_cards, _go, _submit, typed):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    trig = ctx.triggered[0]
+    if trig["prop_id"].startswith(("btn-dive-go", "dive-input")):
+        t = (_parse_tickers(typed) or [None])[0]
+        return t or no_update
+    if not trig.get("value"):
+        return no_update
+    try:
+        return json.loads(trig["prop_id"].rsplit(".", 1)[0]).get("ticker") or no_update
+    except Exception:
+        return no_update
+
+
+@app.callback(
+    Output("store-dive-data", "data"),
+    Output("dive-status",     "children"),
+    Input("store-dive-ticker", "data"),
+    Input("main-tabs",         "value"),
+    State("store-dive-data",   "data"),
+    prevent_initial_call=True,
+)
+def load_dive(ticker, tab, current):
+    trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+    if trigger.startswith("main-tabs") and tab != "tab-deep":
+        return no_update, no_update
+    if not ticker or (current and current.get("ticker") == ticker):
+        return no_update, no_update
+    data = build_deep_dive(ticker)
+    if not data:
+        return no_update, html.Span(f"No data found for {ticker}", className="status-warn")
+    return data, f"{data['company']} · loaded {pd.Timestamp.now().strftime('%I:%M %p').lstrip('0')}"
+
+
+@app.callback(
+    Output("dive-wrap",     "className"),
+    Output("dive-header",   "children"),
+    Output("dive-about",    "children"),
+    Output("dive-drivers",  "children"),
+    Output("dive-history",  "children"),
+    Output("dive-leaders",  "children"),
+    Output("dive-filings",  "children"),
+    Output("dive-snapshot", "children"),
+    Output("graph-dive-price", "figure"),
+    Output("graph-dive-eps",   "figure"),
+    Input("store-dive-data",   "data"),
+    State("store-picks",       "data"),
+    State("store-dive-xrange", "data"),
+)
+def render_dive(d, picks, xrange):
+    if not d:
+        return "hidden", *([no_update] * 9)
+    sym = d["ticker"]
+    pick = next((p for p in (picks or {}).get("picks", []) if p["ticker"] == sym), None)
+    theme = next((name for _i, name, _d, ms in THEMES if sym in ms), None)
+    tags = _kids(
+        html.Span("★ In your watchlist", className="badge badge-blue") if sym in _my_tickers() else None,
+        html.Span(f"Theme: {theme}", className="badge badge-blue") if theme else None,
+        html.Span(f"This week’s pick — {pick['label']}", className="badge badge-hot") if pick else None,
+    )
+    meta = [x for x in (d.get("sector"), d.get("industry"), d.get("hq"),
+                        f"{d['employees']:,} employees" if d.get("employees") else None) if x]
+    header = html.Div([
+        html.Div([
+            html.Div([html.Span(sym, className="dive-sym"), html.Span(d["company"], className="dive-name")]),
+            html.Div(_kids(*[html.Span(m) for m in meta],
+                           html.A(d["website"].replace("https://", "").replace("http://", "").rstrip("/"),
+                                  href=d["website"], target="_blank", rel="noopener noreferrer")
+                           if d.get("website") else None), className="dive-meta"),
+            html.Div(tags, className="dive-tags") if tags else None,
+            html.Div(pick["reason"], className="pick-reason") if pick else None,
+        ]),
+        html.Div([html.Div(_price(d.get("price")), className="dive-price"), _chip(d.get("change")),
+                  html.Div(_large(d.get("marketCap")) + " market cap", className="stat-k")],
+                 className="dive-quote"),
+    ], className="dive-header-inner")
+
+    drivers = _drivers(d)
+    drivers_ui = html.Ul([html.Li(text, className=f"drv drv-{tone}") for tone, text in drivers],
+                         className="drivers") if drivers else _empty("Not enough reported data")
+
+    hists = get_histories_1y([sym])
+    price_fig = _compare_figs(hists, [sym], xrange)[1] if sym in hists else _empty_fig("No price history")
+    if sym in hists:    # narrow sidebar: legend below so it clears the range buttons
+        price_fig.update_layout(legend=dict(orientation="h", x=0, xanchor="left", y=-0.12,
+                                            yanchor="top"), margin=dict(l=4, r=4, t=40, b=34))
+    return ("", header, html.P(d.get("summary") or "No description available."), drivers_ui,
+            _history_block(d.get("wiki")), _leaders_block(d.get("officers")),
+            _filings_block(d.get("filings")), _snapshot(sym), price_fig, _eps_fig(d))
+
+
+@app.callback(
+    Output("graph-dive-fin",  "figure"),
+    Output("dive-fin-table",  "children"),
+    Output("graph-dive-cash", "figure"),
+    Input("store-dive-data",  "data"),
+    Input("seg-dive-period",  "value"),
+)
+def render_dive_fin(d, period):
+    if not d:
+        return no_update, no_update, no_update
+    annual = period != "q"
+    inc  = d.get("a_income") if annual else d.get("q_income")
+    cash = d.get("a_cash") if annual else d.get("q_cash")
+    return _fin_fig(inc, annual), _fin_table(inc, annual), _cash_fig(cash, annual)
+
+
 def _warm_caches():
     try:
         load_analyst_data()
         fetch_analyst_headlines()
+        build_weekly_picks()          # no-op if this week's list already exists
     except Exception as e:
         print(f"Cache warm-up: {e}")
 
