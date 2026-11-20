@@ -19,6 +19,7 @@ from dash.dash_table.Format import Format, Scheme, Sign, Symbol
 import yfinance as yf
 
 from screener import load_tickers
+from lessons import LESSONS, LESSON_BY_ID, TRACKS
 
 SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 WATCHLISTS_FILE = os.path.join(SCRIPT_DIR, "watchlists.json")
@@ -1171,6 +1172,103 @@ def build_weekly_picks(force: bool = False) -> dict:
         return entry
 
 
+# ── Learn: lesson schedule, live examples and quizzes ────────────────────────
+LEARN_CADENCE_DAYS = 2
+
+
+def _learn_slot(ts=None) -> int:
+    """Rotation slot: changes every LEARN_CADENCE_DAYS days."""
+    d = pd.Timestamp.fromtimestamp(ts) if ts else pd.Timestamp.now()
+    return d.toordinal() // LEARN_CADENCE_DAYS
+
+
+def scheduled_lesson(slot=None) -> dict:
+    return LESSONS[(slot if slot is not None else _learn_slot()) % len(LESSONS)]
+
+
+def learn_rows() -> list:
+    """Watchlist fundamentals plus derived metrics used by lesson examples."""
+    tickers = load_tickers()
+    rows = fetch_fundamentals(tickers)
+    hists = get_histories_1y(tickers + ["^GSPC"])
+    spx_1y = _pct_full(hists.get("^GSPC"))
+    for r in rows:
+        mc, cash, debt, fcf = r.get("Market Cap"), r.get("Cash"), r.get("Debt"), r.get("FCF")
+        r["Net Cash"] = cash - debt if _ok(cash) and _ok(debt) else None
+        r["EV"] = mc + debt - cash if _ok(mc) and _ok(cash) and _ok(debt) else None
+        r["FCF Yield %"] = fcf / mc * 100 if _ok(fcf) and _ok(mc) and mc else None
+        g, om = r.get("Rev Growth %"), r.get("Op Margin %")
+        r["Rule of 40"] = g + om if _ok(g) and _ok(om) and abs(om) < 500 else None
+        ser = hists.get(r["Ticker"])
+        for win in (50, 200):
+            ma = ser.rolling(win).mean().iloc[-1] if ser is not None and len(ser) >= win else None
+            r[f"vs {win}D %"] = (ser.iloc[-1] / ma - 1) * 100 if _ok(ma) and ma else None
+        r["vs S&P 1Y"] = r["1Y %"] - spx_1y if _ok(r.get("1Y %")) and _ok(spx_1y) else None
+    return rows
+
+
+def _shuffle_question(q: dict, salt: str) -> dict:
+    """Stable per-question option shuffle (the library lists the answer first)."""
+    import random
+    import zlib
+    order = list(range(len(q["options"])))
+    random.Random(zlib.crc32((q["q"] + salt).encode())).shuffle(order)
+    return {"q": q["q"], "options": [q["options"][i] for i in order],
+            "answer": order.index(q["answer"]), "why": q["why"]}
+
+
+def _live_question(lesson: dict, rows: list, salt: str) -> dict | None:
+    """'Which of your stocks has the highest X right now?' from live data."""
+    ex = lesson.get("example")
+    if not ex:
+        return None
+    import random
+    import zlib
+    m = ex["metric"]
+    vals = [(r["Ticker"], r.get(m)) for r in rows
+            if isinstance(r.get(m), (int, float)) and _ok(r.get(m))
+            and (not ex.get("positive_only") or r[m] > 0)]
+    if len(vals) < 3:
+        return None
+    rng = random.Random(zlib.crc32((lesson["id"] + salt).encode()))
+    pick = rng.sample(vals, min(4, len(vals)))
+    best = max(pick, key=lambda kv: kv[1])
+    fmt = lambda v: _fmt_metric(m, v)
+    return {"q": f"Live data: which of these stocks in your watchlist has the highest {ex['label']} right now?",
+            "options": [t for t, _ in pick], "answer": [t for t, _ in pick].index(best[0]),
+            "why": " · ".join(f"{t} {fmt(v)}" for t, v in sorted(pick, key=lambda kv: -kv[1])),
+            "live": True}
+
+
+def build_quiz(mode: str, lesson_id: str | None, done: list, salt: str) -> dict:
+    import random
+    import zlib
+    if mode == "review":
+        rng = random.Random(zlib.crc32(salt.encode()))
+        done_ids = [i for i in (done or []) if i in LESSON_BY_ID]
+        studied = [(lid, q) for lid in done_ids for q in LESSON_BY_ID[lid]["quiz"]]
+        others = [(l["id"], q) for l in LESSONS if l["id"] not in done_ids for q in l["quiz"]]
+        chosen = rng.sample(studied, min(5, len(studied)))
+        if len(chosen) < 5:            # top up from the rest of the library
+            chosen += rng.sample(others, min(5 - len(chosen), len(others)))
+        qs = [{**_shuffle_question(q, salt), "lesson": lid} for lid, q in chosen]
+        n_studied = sum(lid in done_ids for lid, _ in chosen)
+        title = (f"Mixed review · {len(qs)} questions"
+                 + (f" ({n_studied} from lessons you’ve completed)" if n_studied else " from across the library"))
+        return {"mode": "review", "lesson": None, "title": title, "questions": qs, "salt": salt}
+    lesson = LESSON_BY_ID[lesson_id]
+    qs = [{**_shuffle_question(q, salt), "lesson": lesson_id} for q in lesson["quiz"]]
+    try:
+        live = _live_question(lesson, learn_rows(), salt)
+    except Exception as e:
+        print(f"Live question: {e}")
+        live = None
+    if live:
+        qs.append({**live, "lesson": lesson_id})
+    return {"mode": "lesson", "lesson": lesson_id, "title": f"Quiz · {lesson['title']}",
+            "questions": qs, "salt": salt}
+
+
 def analyst_window(records: list, window: str, sort: str, headlines: list | None = None):
     """Rank stocks by analyst attention within the window: dated rating/price-target
     actions (Yahoo) plus analyst-related headlines. Returns (rows, totals)."""
@@ -1681,6 +1779,103 @@ def _filings_block(filings: list):
         html.Details([html.Summary(f"Other filings ({len(other)})"),
                       html.Div([row(f) for f in other[:25]])], className="hist-more") if other else None,
     ))
+
+# ── Learn UI pieces ───────────────────────────────────────────────────────────
+_METRIC_FMT = {
+    "money": {"FCF", "Market Cap", "EV", "Cash", "Debt", "Net Cash"},
+    "x":     {"P/E", "Fwd P/E", "EV/EBITDA"},
+    "num":   {"PEG", "Beta", "Rule of 40"},
+    "price": {"EPS", "Target"},
+    "text":  {"Rating"},
+}
+_METRIC_NAMES = {"vs 50D %": "vs 50-day MA", "vs 200D %": "vs 200-day MA", "vs S&P 1Y": "1Y vs S&P",
+                 "Rev Growth %": "Revenue growth", "Op Margin %": "Op margin",
+                 "Gross Margin %": "Gross margin", "Profit Margin %": "Net margin",
+                 "FCF Yield %": "FCF yield", "Short %": "Short float", "Upside %": "PT upside",
+                 "Net Cash": "Net cash", "1Y %": "1Y return"}
+
+
+def _fmt_metric(col, v):
+    if not _ok(v) or v is None:
+        return "—"
+    if col in _METRIC_FMT["text"]:
+        return str(v) or "—"
+    if col in _METRIC_FMT["money"]:
+        return ("−" + _large(-v)) if v < 0 else _large(v)
+    if col in _METRIC_FMT["x"]:
+        return "n/m" if v <= 0 else f"{v:,.1f}×"
+    if col in _METRIC_FMT["num"]:
+        return f"{v:,.2f}" if col != "Rule of 40" else f"{v:,.0f}"
+    if col in _METRIC_FMT["price"]:
+        return f"${v:,.2f}"
+    return ("n/m" if abs(v) >= 1000 else
+            _pct(v, 1) if col in ("vs 50D %", "vs 200D %", "vs S&P 1Y", "Upside %", "Rev Growth %", "1Y %")
+            else f"{v:.1f}%")
+
+
+def _lesson_example(lesson: dict):
+    ex = lesson.get("example")
+    if not ex:
+        return html.Div("This one is conceptual — try spotting it in the Deep Dive tab’s financials "
+                        "for a company you follow.", className="field-hint")
+    try:
+        rows = learn_rows()
+    except Exception as e:
+        print(f"Learn rows: {e}")
+        rows = []
+    m = ex["metric"]
+    usable = [r for r in rows if isinstance(r.get(m), (int, float)) and _ok(r.get(m))
+              and (not ex.get("positive_only") or r[m] > 0)]
+    ranked = sorted(usable, key=lambda r: -r[m]) + [r for r in rows if r not in usable]
+    cols = ex["cols"]
+    table = html.Div(html.Table([
+        html.Thead(html.Tr([html.Th("Stock")] + [html.Th(_METRIC_NAMES.get(c, c),
+                                                         className="is-metric" if c == m else "")
+                                                 for c in cols])),
+        html.Tbody([html.Tr([html.Td([html.B(r["Ticker"]), html.Span(" " + (r.get("Company") or "")[:22],
+                                                                     className="stat-k")])] +
+                            [html.Td(_fmt_metric(c, r.get(c)),
+                                     className=_cx("is-metric" if c == m else "",
+                                                   _tone(r.get(c)) if c in ("vs 50D %", "vs 200D %",
+                                                                            "vs S&P 1Y", "Upside %",
+                                                                            "Net Cash", "FCF") else ""))
+                             for c in cols]) for r in ranked]),
+    ], className="fin-table"), className="fin-table-wrap")
+    insight = None
+    if len(usable) >= 2:
+        hi, lo = ranked[0], ranked[len(usable) - 1]      # ranked = usable sorted high→low first
+        insight = html.Div([
+            html.B(hi["Ticker"]), f" has the highest {ex['label']} in your watchlist at ",
+            html.B(_fmt_metric(m, hi[m])), f" — {ex['high_means']}. ",
+            html.B(lo["Ticker"]), " is lowest at ", html.B(_fmt_metric(m, lo[m])), ".",
+            (f" {len(rows) - len(usable)} name(s) show “—” or n/m because the metric doesn’t apply."
+             if len(rows) > len(usable) else ""),
+        ], className="insight")
+    return html.Div(_kids(insight, table))
+
+
+def _lesson_view(lesson: dict, how: str, done: bool, score):
+    badge = {"today": "Today’s lesson", "picked": "Picked from library",
+             "surprise": "Surprise pick", "next": "Next lesson"}.get(how, "Lesson")
+    return html.Div(_kids(
+        html.Div(_kids(
+            html.Span(lesson["track"], className="badge badge-blue"),
+            html.Span(badge, className="badge badge-hot"),
+            html.Span(f"{lesson['minutes']} min read", className="stat-k"),
+            html.Span(f"✓ Completed · best quiz {score[0]}/{score[1]}" if done and score else
+                      "✓ Completed" if done else None, className="badge badge-green") if done else None,
+        ), className="lesson-meta"),
+        html.H2(lesson["title"], className="lesson-title"),
+        html.P(lesson["summary"], className="lesson-summary"),
+        html.Div(lesson["formula"], className="formula") if lesson.get("formula") else None,
+        *[html.Div([html.H3(h, className="lesson-h"), html.P(t)], className="lesson-sec")
+          for h, t in lesson["sections"]],
+        html.Div([html.H3("In practice — your watchlist right now", className="lesson-h"),
+                  _lesson_example(lesson)], className="lesson-sec lesson-live"),
+        html.Div([html.H3("Watch out for", className="lesson-h"),
+                  html.Ul([html.Li(p) for p in lesson["pitfalls"]], className="pitfalls")],
+                 className="lesson-sec"),
+    ), className="lesson")
 
 # ── Analyst UI pieces ─────────────────────────────────────────────────────────
 RATING_COLORS = ["#16935a", "#21c07a", "#6b7385", "#f2495c", "#b4232f"]
@@ -2534,6 +2729,41 @@ deep_tab = html.Div([
     ]),
 ])
 
+# ── Learn tab ─────────────────────────────────────────────────────────────────
+learn_tab = html.Div([
+    dcc.Store(id="store-learn-current",  data=None, storage_type="local"),
+    dcc.Store(id="store-learn-progress", data={"done": [], "scores": {}, "reviews": []},
+              storage_type="local"),
+    dcc.Store(id="store-quiz", data=None),
+
+    _page_head("Learn",
+               f"A new investing concept every {LEARN_CADENCE_DAYS} days — explained, shown on your "
+               "watchlist, then quizzed", [
+        html.Div(id="learn-status", className="status"),
+        _btn("Surprise me", "btn-learn-surprise", "btn-ghost"),
+        _btn("Next lesson →", "btn-learn-next", "btn-primary"),
+    ]),
+    html.Div([
+        html.Div([
+            dcc.Loading(_panel(html.Div(id="div-lesson", children=[_empty("Loading lesson…")])),
+                        type="dot", color=ACCENT),
+            _panel([
+                html.Div(id="div-quiz"),
+                html.Div([_btn("Check answers", "btn-quiz-check", "btn-primary"),
+                          _btn("New mixed review", "btn-learn-review", "btn-ghost"),
+                          html.Div(id="div-quiz-result", className="quiz-result")],
+                         className="quiz-actions"),
+            ], title=html.Span(id="quiz-title"), sub="Pick an answer for each question, then check",
+               className="quiz-panel"),
+        ], className="learn-main"),
+        html.Div([
+            _panel(html.Div(id="div-learn-progress"), title="Your progress"),
+            _panel(html.Div(id="div-library"), title="Library",
+                   sub="Click any lesson to study it now"),
+        ], className="learn-side"),
+    ], className="learn-grid"),
+])
+
 # ── Root layout ───────────────────────────────────────────────────────────────
 app.layout = html.Div(className="app", children=[
     dcc.Store(id="store-watchlists", data=load_watchlists()),
@@ -2562,6 +2792,7 @@ app.layout = html.Div(className="app", children=[
                 ("News",     "tab-news",     news_tab),
                 ("Analysts", "tab-analyst",  analyst_tab),
                 ("Deep Dive", "tab-deep",    deep_tab),
+                ("Learn",    "tab-learn",    learn_tab),
             ]
         ],
     ),
@@ -3659,6 +3890,210 @@ def render_dive_fin(d, period):
     inc  = d.get("a_income") if annual else d.get("q_income")
     cash = d.get("a_cash") if annual else d.get("q_cash")
     return _fin_fig(inc, annual), _fin_table(inc, annual), _cash_fig(cash, annual)
+
+
+# ── LEARN CALLBACKS ───────────────────────────────────────────────────────────
+
+@app.callback(
+    Output("store-learn-current", "data"),
+    Input("main-tabs", "value"),
+    Input({"type": "lesson-link", "id": ALL}, "n_clicks"),
+    Input("btn-learn-next",     "n_clicks"),
+    Input("btn-learn-surprise", "n_clicks"),
+    State("store-learn-current",  "data"),
+    State("store-learn-progress", "data"),
+    prevent_initial_call=True,
+)
+def learn_nav(tab, _links, _next, _surprise, current, progress):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    trig = ctx.triggered[0]
+    pid = trig["prop_id"]
+    slot = _learn_slot()
+    done = set((progress or {}).get("done", []))
+    cur_id = (current or {}).get("id")
+    if pid.startswith("main-tabs"):
+        if tab != "tab-learn":
+            return no_update
+        # new rotation slot (or first visit) → today's scheduled lesson
+        if not current or current.get("slot") != slot or cur_id not in LESSON_BY_ID:
+            return {"id": scheduled_lesson(slot)["id"], "slot": slot, "how": "today"}
+        return no_update
+    ids = [l["id"] for l in LESSONS]
+    if pid.startswith("btn-learn-next"):
+        start = ids.index(cur_id) + 1 if cur_id in ids else 0
+        order = ids[start:] + ids[:start]
+        nxt = next((i for i in order if i not in done), order[0])
+        return {"id": nxt, "slot": slot, "how": "next"}
+    if pid.startswith("btn-learn-surprise"):
+        import random
+        pool = [i for i in ids if i not in done and i != cur_id] or [i for i in ids if i != cur_id]
+        return {"id": random.choice(pool), "slot": slot, "how": "surprise"}
+    if not trig.get("value"):
+        return no_update
+    try:
+        lid = json.loads(pid.rsplit(".", 1)[0]).get("id")
+    except Exception:
+        return no_update
+    return {"id": lid, "slot": slot, "how": "picked"} if lid in LESSON_BY_ID else no_update
+
+
+@app.callback(
+    Output("div-lesson",   "children"),
+    Output("learn-status", "children"),
+    Input("store-learn-current",  "data"),
+    Input("store-learn-progress", "data"),
+    State("main-tabs", "value"),
+)
+def render_lesson(current, progress, tab):
+    if tab != "tab-learn" or not current or current.get("id") not in LESSON_BY_ID:
+        return no_update, no_update
+    lesson = LESSON_BY_ID[current["id"]]
+    done = lesson["id"] in (progress or {}).get("done", [])
+    score = (progress or {}).get("scores", {}).get(lesson["id"])
+    days_left = LEARN_CADENCE_DAYS - pd.Timestamp.now().toordinal() % LEARN_CADENCE_DAYS
+    status = (f"New lesson {'tomorrow' if days_left == 1 else f'in {days_left} days'} · "
+              f"{len((progress or {}).get('done', []))}/{len(LESSONS)} completed")
+    return _lesson_view(lesson, current.get("how"), done, score), status
+
+
+@app.callback(
+    Output("store-quiz", "data"),
+    Input("store-learn-current", "data"),
+    Input("btn-learn-review",    "n_clicks"),
+    Input("main-tabs",           "value"),
+    State("store-learn-progress", "data"),
+    State("store-quiz",           "data"),
+    prevent_initial_call=True,
+)
+def make_quiz(current, _review, tab, progress, quiz):
+    trig = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+    if tab != "tab-learn":
+        return no_update
+    if trig.startswith("btn-learn-review"):
+        return build_quiz("review", None, (progress or {}).get("done", []), salt=str(time.time()))
+    if not current or current.get("id") not in LESSON_BY_ID:
+        return no_update
+    if quiz and quiz.get("mode") == "lesson" and quiz.get("lesson") == current["id"] \
+            and trig.startswith("main-tabs"):
+        return no_update
+    return build_quiz("lesson", current["id"], [], salt=f"{current['id']}-{current.get('slot')}")
+
+
+@app.callback(
+    Output("div-quiz",        "children"),
+    Output("quiz-title",      "children"),
+    Output("div-quiz-result", "children"),
+    Input("store-quiz", "data"),
+)
+def render_quiz(quiz):
+    if not quiz:
+        return _empty("Open a lesson to get its quiz"), "Quiz yourself", ""
+    items = []
+    for i, q in enumerate(quiz["questions"]):
+        lesson = LESSON_BY_ID.get(q.get("lesson"), {})
+        items.append(html.Div(_kids(
+            html.Div(_kids(
+                html.Span(f"{i + 1}", className="quiz-num"),
+                html.Span(q["q"], className="quiz-q"),
+            ), className="quiz-head"),
+            html.Div(lesson.get("title", ""), className="field-hint quiz-from")
+            if quiz["mode"] == "review" else None,
+            html.Span("LIVE DATA", className="badge badge-hot quiz-live") if q.get("live") else None,
+            dcc.RadioItems(id={"type": "quiz-a", "i": i},
+                           options=[{"label": o, "value": j} for j, o in enumerate(q["options"])],
+                           value=None, className="quiz-opts"),
+            html.Div(id={"type": "quiz-fb", "i": i}, className="quiz-fb"),
+        ), className="quiz-item"))
+    return items, quiz["title"], ""
+
+
+@app.callback(
+    Output({"type": "quiz-fb", "i": ALL}, "children"),
+    Output("div-quiz-result", "children", allow_duplicate=True),
+    Output("store-learn-progress", "data"),
+    Input("btn-quiz-check", "n_clicks"),
+    State({"type": "quiz-a", "i": ALL}, "value"),
+    State("store-quiz", "data"),
+    State("store-learn-progress", "data"),
+    prevent_initial_call=True,
+)
+def check_quiz(_n, answers, quiz, progress):
+    if not quiz or not answers:
+        return [no_update] * len(answers or []), no_update, no_update
+    qs = quiz["questions"]
+    if any(a is None for a in answers):
+        missing = [str(i + 1) for i, a in enumerate(answers) if a is None]
+        return ([no_update] * len(answers),
+                html.Span(f"Answer question{'s' if len(missing) > 1 else ''} {', '.join(missing)} first",
+                          className="status-warn"), no_update)
+    fb, correct = [], 0
+    for q, a in zip(qs, answers):
+        ok = a == q["answer"]
+        correct += ok
+        fb.append(html.Div([
+            html.Span("✓ Correct. " if ok else f"✗ Answer: {q['options'][q['answer']]}. ",
+                      className="up" if ok else "down"),
+            html.Span(q["why"]),
+        ]))
+    n = len(qs)
+    progress = dict(progress or {"done": [], "scores": {}, "reviews": []})
+    progress.setdefault("done", []); progress.setdefault("scores", {}); progress.setdefault("reviews", [])
+    passed = correct >= -(-3 * n // 4)        # ≥ 75%, rounded up
+    if quiz["mode"] == "lesson":
+        lid = quiz["lesson"]
+        best = progress["scores"].get(lid)
+        if not best or correct / n > best[0] / best[1]:
+            progress["scores"][lid] = [correct, n]
+        if passed and lid not in progress["done"]:
+            progress["done"] = progress["done"] + [lid]
+        msg = (f"{correct}/{n} — lesson complete ✓" if passed else
+               f"{correct}/{n} — reread the lesson and try again (need {-(-3 * n // 4)} to complete it)")
+    else:
+        progress["reviews"] = (progress["reviews"] + [[int(time.time()), correct, n]])[-50:]
+        msg = f"{correct}/{n} on this review" + (" — nice work ✓" if passed else " — keep at it")
+    return fb, html.Span(msg, className="up" if passed else "amber"), progress
+
+
+@app.callback(
+    Output("div-learn-progress", "children"),
+    Output("div-library",        "children"),
+    Input("store-learn-progress", "data"),
+    Input("store-learn-current",  "data"),
+)
+def render_learn_side(progress, current):
+    progress = progress or {}
+    done, scores, reviews = set(progress.get("done", [])), progress.get("scores", {}), progress.get("reviews", [])
+    pct = len(done) / len(LESSONS) * 100
+    attempts = [s for s in scores.values() if s and s[1]] + [[c, n] for _t, c, n in reviews if n]
+    avg = sum(c / n for c, n in attempts) / len(attempts) * 100 if attempts else None
+    prog = html.Div([
+        html.Div([html.Span(f"{len(done)}", className="kpi-value"),
+                  html.Span(f" of {len(LESSONS)} lessons completed", className="stat-k")]),
+        html.Div(html.Div(style={"width": f"{pct:.0f}%"}, className="prog-fill"), className="prog-track"),
+        html.Div(_kids(
+            html.Span(f"Average quiz score {avg:.0f}%") if avg is not None else
+            html.Span("Take a quiz to start tracking scores"),
+            html.Span(f"{len(reviews)} review quiz{'zes' if len(reviews) != 1 else ''}") if reviews else None,
+        ), className="prog-meta"),
+    ])
+    cur = (current or {}).get("id")
+    lib = []
+    for track in TRACKS:
+        rows = []
+        for l in [l for l in LESSONS if l["track"] == track]:
+            s = scores.get(l["id"])
+            rows.append(html.Div([
+                html.Span("✓" if l["id"] in done else "○",
+                          className=_cx("lib-mark", "up" if l["id"] in done else "")),
+                html.Span(l["title"], className="lib-title"),
+                html.Span(f"{s[0]}/{s[1]}" if s else f"{l['minutes']}m", className="lib-meta"),
+            ], id={"type": "lesson-link", "id": l["id"]}, n_clicks=0,
+                className=_cx("lib-row", "is-active" if l["id"] == cur else "")))
+        lib.append(html.Div([html.Div(track, className="filter-group-title")] + rows,
+                            className="lib-group"))
+    return prog, lib
 
 
 def _warm_caches():
