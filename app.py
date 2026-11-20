@@ -17,7 +17,7 @@ from dash import (Dash, dcc, html, dash_table, Input, Output, State,
 from dash.dash_table.Format import Format, Scheme, Sign, Symbol
 import yfinance as yf
 
-from screener import fetch_ticker, load_tickers
+from screener import load_tickers
 
 SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 WATCHLISTS_FILE = os.path.join(SCRIPT_DIR, "watchlists.json")
@@ -51,6 +51,10 @@ MARKET_INDICES = [
     {"symbol": "^RUT",  "name": "Russell 2000"},
     {"symbol": "^VIX",  "name": "VIX"},
     {"symbol": "^TNX",  "name": "10-Yr Yield"},
+    {"symbol": "CL=F",     "name": "WTI Crude"},
+    {"symbol": "GC=F",     "name": "Gold"},
+    {"symbol": "BTC-USD",  "name": "Bitcoin"},
+    {"symbol": "DX-Y.NYB", "name": "US Dollar"},
 ]
 CHART_INDICES = ["^GSPC", "^IXIC", "^DJI", "^RUT"]
 
@@ -200,6 +204,7 @@ def yahoo_screen(operands: list, max_results: int = 500) -> pd.DataFrame:
         "averageDailyVolume3Month": "Avg Volume", "regularMarketVolume": "Volume",
         "fiftyTwoWeekHigh": "52W High", "fiftyTwoWeekLow": "52W Low",
         "fiftyTwoWeekChangePercent": "1Y %",
+        "earningsTimestamp": "Earnings",
     }
     df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
     # drop preferred shares / depositary preferreds (e.g. JPM-PC); keep class shares like BRK-B
@@ -208,7 +213,7 @@ def yahoo_screen(operands: list, max_results: int = 500) -> pd.DataFrame:
         rng = (df["52W High"] - df["52W Low"]).where(lambda r: r > 0)
         df["52W Pos %"] = (df["Price"] - df["52W Low"]) / rng * 100
     keep = ["Ticker", "Company", "Price", "1D %", "1Y %", "Market Cap", "P/E", "Fwd P/E",
-            "EPS", "Avg Volume", "Volume", "52W High", "52W Low", "52W Pos %"]
+            "EPS", "Avg Volume", "Volume", "52W High", "52W Low", "52W Pos %", "Earnings"]
     return df[[c for c in keep if c in df.columns]]
 
 
@@ -484,6 +489,7 @@ def build_news_trending(hours: int, force: bool = False):
             "1D %":       q.get("regularMarketChangePercent"),
             "1M %":       _pct_back(ser, 21),
             "Market Cap": q.get("marketCap"),
+            "Earnings":   q.get("earningsTimestamp"),
             "Mentions":   counts[s],
             "Trending":   s in trending,
             "Spark":      [round(float(v), 4) for v in ser.iloc[-22:]] if ser is not None else [],
@@ -641,7 +647,8 @@ def load_analyst_data(force: bool = False) -> list:
                                      "Company": q.get("shortName") or q.get("longName") or "",
                                      "Price": q.get("regularMarketPrice"),
                                      "1D %": q.get("regularMarketChangePercent"),
-                                     "Market Cap": q.get("marketCap")}
+                                     "Market Cap": q.get("marketCap"),
+                                     "Earnings": q.get("earningsTimestamp")}
         if _yahoo._s is None:
             _yahoo._init()
         with ThreadPoolExecutor(max_workers=12) as pool:
@@ -651,7 +658,7 @@ def load_analyst_data(force: bool = False) -> list:
             if not rec:
                 continue
             base = info[rec["Ticker"]]
-            rec.update({k: base.get(k) for k in ("Company", "Price", "1D %", "Market Cap")})
+            rec.update({k: base.get(k) for k in ("Company", "Price", "1D %", "Market Cap", "Earnings")})
             for k, v in list(rec.items()):
                 if isinstance(v, float) and v != v:
                     rec[k] = None
@@ -664,6 +671,212 @@ def load_analyst_data(force: bool = False) -> list:
             except Exception as e:
                 print(f"Analyst cache write: {e}")
         return _analyst["records"]
+
+
+# ── Fast batched fundamentals (quotes + quoteSummary + history) ──────────────
+FUND_TTL = 30 * 60
+_fund_cache: dict = {}            # symbol -> (timestamp, extras dict)
+
+
+def _pct_or_none(v):
+    return v * 100 if isinstance(v, (int, float)) and v == v else None
+
+
+def _fetch_fund_extra(sym: str) -> dict:
+    hit = _fund_cache.get(sym)
+    if hit and time.time() - hit[0] < FUND_TTL:
+        return hit[1]
+    try:
+        d = _yahoo.get_json(
+            f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}",
+            {"modules": "financialData,defaultKeyStatistics,summaryProfile,calendarEvents"})
+        r = (d.get("quoteSummary", {}).get("result") or [None])[0] or {}
+    except Exception as e:
+        print(f"Fundamentals '{sym}': {e}")
+        return {}
+    fd, ks = r.get("financialData") or {}, r.get("defaultKeyStatistics") or {}
+    sp, ce = r.get("summaryProfile") or {}, r.get("calendarEvents") or {}
+    dates = [_raw(x) for x in (ce.get("earnings") or {}).get("earningsDate", []) if _raw(x)]
+    out = {
+        "Sector":          sp.get("sector"),
+        "Industry":        sp.get("industry"),
+        "Rev Growth %":    _pct_or_none(_raw(fd.get("revenueGrowth"))),
+        "Profit Margin %": _pct_or_none(_raw(fd.get("profitMargins"))),
+        "Gross Margin %":  _pct_or_none(_raw(fd.get("grossMargins"))),
+        "Op Margin %":     _pct_or_none(_raw(fd.get("operatingMargins"))),
+        "FCF":             _raw(fd.get("freeCashflow")),
+        "Cash":            _raw(fd.get("totalCash")),
+        "Debt":            _raw(fd.get("totalDebt")),
+        "Target":          _raw(fd.get("targetMeanPrice")),
+        "Target Low":      _raw(fd.get("targetLowPrice")),
+        "Target High":     _raw(fd.get("targetHighPrice")),
+        "recKey":          fd.get("recommendationKey") or "none",
+        "Analysts":        _raw(fd.get("numberOfAnalystOpinions")),
+        "PEG":             _raw(ks.get("pegRatio")),
+        "EV/EBITDA":       _raw(ks.get("enterpriseToEbitda")),
+        "Beta":            _raw(ks.get("beta")),
+        "Short %":         _pct_or_none(_raw(ks.get("shortPercentOfFloat"))),
+        "Inst %":          _pct_or_none(_raw(ks.get("heldPercentInstitutions"))),
+        "Earnings":        min(dates) if dates else None,
+    }
+    _fund_cache[sym] = (time.time(), out)
+    return out
+
+
+def _pct_full(ser):
+    """Change over the whole (≈1Y) series."""
+    return float((ser.iloc[-1] / ser.iloc[0] - 1) * 100) if ser is not None and len(ser) > 200 else None
+
+
+def fetch_fundamentals(symbols: list) -> list:
+    """Screener rows for `symbols` in ~2-4s: one batched quote call, parallel
+    quoteSummary calls and one bulk price-history download."""
+    symbols = list(dict.fromkeys(s for s in symbols if s))
+    if not symbols:
+        return []
+    quotes = {q["symbol"]: q for q in _yahoo.get_quotes(symbols)}
+    if _yahoo._s is None:
+        _yahoo._init()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        extras = dict(zip(symbols, pool.map(_fetch_fund_extra, symbols)))
+    hists = get_histories_1y(symbols)
+    rows = []
+    for s in symbols:
+        q = quotes.get(s)
+        if not q or q.get("regularMarketPrice") is None:
+            continue
+        ex, ser = extras.get(s) or {}, hists.get(s)
+        price = q["regularMarketPrice"]
+        hi, lo = q.get("fiftyTwoWeekHigh"), q.get("fiftyTwoWeekLow")
+        tgt = ex.get("Target")
+        rows.append({
+            "Ticker":   s,
+            "Company":  q.get("shortName") or q.get("longName") or "",
+            "Price":    price,
+            "1D %":     q.get("regularMarketChangePercent"),
+            "1W %":     _pct_back(ser, 5),  "1M %": _pct_back(ser, 21),
+            "3M %":     _pct_back(ser, 63), "6M %": _pct_back(ser, 126),
+            "1Y %":     _pct_full(ser),
+            "Market Cap": q.get("marketCap"),
+            "P/E":      q.get("trailingPE"),
+            "Fwd P/E":  q.get("forwardPE"),
+            "EPS":      q.get("epsTrailingTwelveMonths"),
+            "52W High": hi, "52W Low": lo,
+            "52W Pos %": (price - lo) / (hi - lo) * 100 if hi and lo and hi > lo else None,
+            "Avg Volume": q.get("averageDailyVolume3Month"),
+            "Volume":   q.get("regularMarketVolume"),
+            "Upside %": (tgt / price - 1) * 100 if tgt and price else None,
+            "Rating":   RATING_LABELS.get(ex.get("recKey") or "none", ""),
+            "Spark":    [round(float(v), 4) for v in ser.iloc[-22:]] if ser is not None else [],
+            **{k: v for k, v in ex.items()},
+        })
+    return rows
+
+
+# ── Thematic baskets (built around the AI-infrastructure watchlist) ──────────
+THEMES = [
+    ("ai-compute", "AI Compute & Semis", "GPUs, custom silicon and foundry",
+     ["NVDA", "AMD", "AVGO", "MRVL", "TSM", "ARM", "ASML"]),
+    ("memory", "Memory & Storage", "HBM, DRAM and NAND for AI servers",
+     ["MU", "SNDK", "WDC", "STX"]),
+    ("power", "AI Power & Nuclear", "Generation and nuclear supply for data centers",
+     ["CEG", "VST", "OKLO", "SMR", "TLN", "NRG", "CCJ", "BWXT"]),
+    ("grid", "Grid & Electrification", "Turbines, switchgear, cooling, grid buildout",
+     ["GEV", "POWL", "ETN", "VRT", "PWR", "HUBB"]),
+    ("quantum", "Quantum Computing", "Pure-play quantum hardware & software",
+     ["IONQ", "RGTI", "QBTS", "QUBT"]),
+    ("cloud", "Hyperscalers & Cloud", "The AI capex spenders",
+     ["AMZN", "GOOGL", "MSFT", "META", "ORCL"]),
+    ("autonomy", "Autonomy & Robotics", "Self-driving, surgical and warehouse robots",
+     ["TSLA", "ISRG", "SYM", "ROK"]),
+]
+THEME_BY_ID = {t[0]: t for t in THEMES}
+
+
+def _basket_index(hists: dict, members: list):
+    """Equal-weight daily-rebalanced index (start = 100) from member closes."""
+    df = pd.DataFrame({m: hists[m] for m in members if m in hists})
+    if df.empty:
+        return None
+    rets = df.sort_index().pct_change().mean(axis=1, skipna=True).fillna(0)
+    return (1 + rets).cumprod() * 100
+
+
+def _ytd_change(ser):
+    if ser is None or not len(ser):
+        return None
+    this_year = ser[ser.index.year == ser.index[-1].year]
+    prior = ser[ser.index < this_year.index[0]] if len(this_year) else ser
+    base = prior.iloc[-1] if len(prior) else ser.iloc[0]
+    return float((ser.iloc[-1] / base - 1) * 100)
+
+
+def _parse_avg_rating(s):
+    """Yahoo 'averageAnalystRating' like '2.1 - Buy' -> (2.1, 'Buy')."""
+    try:
+        num, label = str(s).split(" - ", 1)
+        return float(num), label.strip()
+    except Exception:
+        return None, ""
+
+
+def build_themes():
+    """Basket metrics + constituent rows for every theme."""
+    members = sorted({m for *_x, ms in THEMES for m in ms})
+    hists   = get_histories_1y(members + ["^GSPC"])
+    quotes  = {q["symbol"]: q for q in _yahoo.get_quotes(members)}
+    spx     = hists.get("^GSPC")
+    themes, series = [], {}
+    for tid, name, desc, ms in THEMES:
+        idx = _basket_index(hists, ms)
+        if idx is None:
+            continue
+        series[tid] = idx
+        perf = {k: _pct_back(idx, n) for k, n in (("1D", 1), ("1W", 5), ("1M", 21), ("3M", 63))}
+        perf["YTD"] = _ytd_change(idx)
+        perf["1Y"]  = float((idx.iloc[-1] / idx.iloc[0] - 1) * 100)
+        m1 = {m: _pct_back(hists.get(m), 21) for m in ms}
+        ranked = sorted((m for m in ms if m1[m] is not None), key=lambda m: m1[m])
+        themes.append({
+            "id": tid, "name": name, "desc": desc, "members": ms, **perf,
+            "spark": [round(float(v), 3) for v in idx.iloc[-63:]],
+            "best": ranked[-1] if ranked else None, "worst": ranked[0] if ranked else None,
+            "mine": [m for m in ms if m in _my_tickers()],
+        })
+    spx_perf = {k: _pct_back(spx, n) for k, n in (("1D", 1), ("1W", 5), ("1M", 21), ("3M", 63))}
+    spx_perf["YTD"] = _ytd_change(spx)
+    spx_perf["1Y"]  = _pct_full(spx)
+    stocks = {}
+    for m in members:
+        q, ser = quotes.get(m) or {}, hists.get(m)
+        if not q:
+            continue
+        mean, label = _parse_avg_rating(q.get("averageAnalystRating"))
+        stocks[m] = {
+            "Ticker": m, "Company": q.get("shortName") or q.get("longName") or "",
+            "Price": q.get("regularMarketPrice"), "1D %": q.get("regularMarketChangePercent"),
+            "1M %": _pct_back(ser, 21), "YTD %": _ytd_change(ser),
+            "Market Cap": q.get("marketCap"), "Earnings": q.get("earningsTimestamp"),
+            "Rating": label, "RatingMean": mean,
+            "Spark": [round(float(v), 4) for v in ser.iloc[-22:]] if ser is not None else [],
+        }
+    return themes, series, spx, spx_perf, stocks
+
+
+def fetch_movers(scr_id: str, n: int = 8, min_cap: float = 2e9) -> list:
+    """Yahoo predefined screens: day_gainers, day_losers, most_actives."""
+    try:
+        j = _yahoo.get_json("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+                            {"scrIds": scr_id, "count": 50})
+        quotes = j["finance"]["result"][0]["quotes"]
+    except Exception as e:
+        print(f"Movers '{scr_id}': {e}")
+        return []
+    out = [q for q in quotes if (q.get("marketCap") or 0) >= min_cap
+           and _is_us_stock_symbol(q.get("symbol", ""))]
+    return [{"Ticker": q["symbol"], "Company": q.get("shortName") or "",
+             "Price": q.get("regularMarketPrice"), "1D %": q.get("regularMarketChangePercent"),
+             "Volume": q.get("regularMarketVolume")} for q in out[:n]]
 
 
 def analyst_window(records: list, window: str, sort: str, headlines: list | None = None):
@@ -690,7 +903,7 @@ def analyst_window(records: list, window: str, sort: str, headlines: list | None
         tot["init"] += inits; tot["stocks"] += 1
         price, target = rec.get("Price"), rec.get("target")
         rows.append({
-            **{k: rec.get(k) for k in ("Ticker", "Company", "Price", "1D %", "Market Cap",
+            **{k: rec.get(k) for k in ("Ticker", "Company", "Price", "1D %", "Market Cap", "Earnings",
                                        "ratings", "target", "targetHi", "targetLo",
                                        "recKey", "recMean", "analysts")},
             "actions": acts, "n": len(acts), "ups": ups, "downs": downs, "inits": inits,
@@ -742,6 +955,21 @@ def _time_ago(ts: float) -> str:
         return f"{mins // 60}h ago"
     return f"{mins // 1440}d ago"
 
+def _earnings_in(ts):
+    """Days until an upcoming earnings date, or None."""
+    if not _ok(ts) or not ts:
+        return None
+    days = (ts - time.time()) / 86400
+    return int(days) if days > -1 else None
+
+def _earnings_stat(ts):
+    d = _earnings_in(ts)
+    if d is None:
+        return None
+    when = time.strftime("%b %d", time.localtime(ts)).replace(" 0", " ")
+    return ("Earnings", f"{when} ({d}d)" if d > 0 else f"{when} (today)",
+            "amber" if d <= 14 else "")
+
 def _fmt_idx(price, sym):
     if not _ok(price): return "—"
     if sym == "^TNX":  return f"{price:.3f}%"
@@ -781,8 +1009,12 @@ def _field(label, control, hint=None, className="", id=None):
                           html.Div(hint, className="field-hint") if hint else None),
                     className=_cx("field", className), **kw)
 
+PERSIST = dict(persistence=True, persistence_type="local")   # remember user choices
+
+
 def _seg(id_, options, value):
-    return dcc.RadioItems(id=id_, options=options, value=value, inline=True, className="seg")
+    return dcc.RadioItems(id=id_, options=options, value=value, inline=True, className="seg",
+                          **PERSIST)
 
 def _empty(msg, warn=False):
     return html.Div(msg, className=_cx("empty", "empty-warn" if warn else ""))
@@ -810,9 +1042,19 @@ def _spark_src(values, w=76, h=28, stretch=False):
     return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
 
 def _quote_card(ticker, id_type, sel_color=None, *, company="", price=None, change=None,
-                spark=None, stats=(), note=None, badge=None, extra=None):
-    """Unified clickable stock card used by Screener, Sectors and News."""
+                spark=None, stats=(), note=None, badge=None, extra=None, earnings=None):
+    """Unified clickable stock card used by every tab. `earnings` (epoch) adds an
+    'ER 5d' badge when a report is due within two weeks."""
     src = _spark_src(spark)
+    badges = []
+    ed = _earnings_in(earnings)
+    if ed is not None and ed <= 14:
+        badges.append(html.Span("ER today" if ed == 0 else f"ER {ed}d", className="badge badge-hot",
+                                title="Earnings " + time.strftime("%b %d", time.localtime(earnings))))
+    if badge:
+        badges.append(html.Span(badge, className="badge badge-hot"))
+    if ticker in _my_tickers():
+        badges.append(html.Span("★", className="badge badge-blue", title="In your watchlist (tickers.txt)"))
     return html.Div(
         id={"type": id_type, "ticker": ticker},
         n_clicks=0,
@@ -830,12 +1072,24 @@ def _quote_card(ticker, id_type, sel_color=None, *, company="", price=None, chan
             html.Div([html.Span([html.Span(k, className="stat-k"),
                                  html.Span(v, className=_cx("stat-v", cls))])
                       for k, v, cls in stats] +
-                     ([html.Span(badge, className="badge badge-hot",
-                                 style={"marginLeft": "auto"})] if badge else []),
-                     className="qcard-stats") if (stats or badge) else None,
+                     ([html.Span(badges, className="qcard-badges")] if badges else []),
+                     className="qcard-stats") if (stats or badges) else None,
             html.Div(note, className="qcard-note", title=note) if note else None,
         ),
     )
+
+_my_tickers_cache = {"ts": 0.0, "set": frozenset()}
+
+
+def _my_tickers():
+    """The user's core watchlist (tickers.txt), re-read at most once a minute."""
+    if time.time() - _my_tickers_cache["ts"] > 60:
+        try:
+            _my_tickers_cache.update(ts=time.time(), set=frozenset(load_tickers()))
+        except Exception:
+            _my_tickers_cache["ts"] = time.time()
+    return _my_tickers_cache["set"]
+
 
 def _sel_color(ticker, selected):
     return CHART_COLORS[selected.index(ticker) % len(CHART_COLORS)] if ticker in selected else None
@@ -987,7 +1241,7 @@ def _y_range(lo, hi):
 
 
 def _compare_figs(series: dict, order: list, xrange=None, default_months=1,
-                  with_price=True, names=None, colors=None):
+                  with_price=True, names=None, colors=None, bench=None, bench_name="S&P 500"):
     """% change (re-based to the first visible day) and price charts.
     The full series is sent to the browser; the visible window defaults to the
     last `default_months` (or the user's last zoom, `xrange`)."""
@@ -1008,10 +1262,14 @@ def _compare_figs(series: dict, order: list, xrange=None, default_months=1,
     norm_fig, price_fig = go.Figure(), go.Figure()
     n_lo = n_hi = p_lo = p_hi = None
     single = len(order) == 1
-    for i, t in enumerate(order):
-        ser   = series[t]
-        name  = names.get(t, t)
-        color = colors.get(t, CHART_COLORS[i % len(CHART_COLORS)])
+    entries = [(t, series[t], names.get(t, t),
+                colors.get(t, CHART_COLORS[i % len(CHART_COLORS)]), False)
+               for i, t in enumerate(order)]
+    if bench is not None and len(bench):
+        bench = bench[bench.index >= first - pd.Timedelta(days=1)]
+        if len(bench):
+            entries.append(("__bench__", bench, bench_name, MUTED, True))
+    for t, ser, name, color, is_bench in entries:
         xs    = ser.index.strftime("%Y-%m-%d").tolist()
         after = ser[ser.index >= x0]
         base  = after.iloc[0] if len(after) else ser.iloc[-1]
@@ -1021,8 +1279,16 @@ def _compare_figs(series: dict, order: list, xrange=None, default_months=1,
             nv, pv = norm[vis], ser[vis]
             n_lo = min(n_lo, nv.min()) if n_lo is not None else nv.min()
             n_hi = max(n_hi, nv.max()) if n_hi is not None else nv.max()
-            p_lo = min(p_lo, pv.min()) if p_lo is not None else pv.min()
-            p_hi = max(p_hi, pv.max()) if p_hi is not None else pv.max()
+            if not is_bench:
+                p_lo = min(p_lo, pv.min()) if p_lo is not None else pv.min()
+                p_hi = max(p_hi, pv.max()) if p_hi is not None else pv.max()
+        if is_bench:
+            norm_fig.add_trace(go.Scatter(
+                x=xs, y=norm.round(3).tolist(), customdata=ser.round(4).tolist(),
+                mode="lines", name=name, line=dict(color=color, width=1.5, dash="dot"),
+                hovertemplate=f"{name}  <b>%{{y:+.2f}}%</b><extra></extra>",
+            ))
+            continue
         norm_fig.add_trace(go.Scatter(
             x=xs, y=norm.round(3).tolist(), customdata=ser.round(4).tolist(),
             mode="lines", name=name, line=dict(color=color, width=2),
@@ -1035,6 +1301,16 @@ def _compare_figs(series: dict, order: list, xrange=None, default_months=1,
             fillcolor="rgba(79,140,255,0.08)" if single else None,
             hovertemplate=f"{name}  <b>$%{{y:,.2f}}</b><extra></extra>",
         ))
+        if single:      # moving averages for a single-stock view
+            for win, col in ((50, AMBER), (200, "#a78bfa")):
+                ma = ser.rolling(win, min_periods=win).mean()
+                if ma.notna().sum() > 1:
+                    price_fig.add_trace(go.Scatter(
+                        x=xs, y=[None if v != v else round(float(v), 4) for v in ma],
+                        mode="lines", name=f"{win}-day MA",
+                        line=dict(color=col, width=1.2, dash="dot"),
+                        hovertemplate=f"{win}D MA  $%{{y:,.2f}}<extra></extra>",
+                    ))
 
     xr = [x0.strftime("%Y-%m-%d"), x1.strftime("%Y-%m-%d")]
     figs = [(norm_fig, _y_range(n_lo, n_hi))]
@@ -1058,11 +1334,86 @@ def _compare_figs(series: dict, order: list, xrange=None, default_months=1,
     return norm_fig, (price_fig if with_price else None)
 
 
+def _range_bar(lo, hi, val, label_lo, label_hi, mid=None):
+    if not (_ok(lo) and _ok(hi) and _ok(val)) or hi <= lo:
+        return None
+    pos = lambda v: max(0.0, min(100.0, (v - lo) / (hi - lo) * 100))
+    return html.Div([
+        html.Div([html.Span(f"{label_lo} {_price(lo)}"), html.Span(f"{label_hi} {_price(hi)}")],
+                 className="rng-labels"),
+        html.Div(_kids(
+            html.Div(className="rng-fill", style={"width": f"{pos(val):.1f}%"}),
+            html.Div(className="rng-mid", style={"left": f"{pos(mid):.1f}%"},
+                     title=f"Mean target {_price(mid)}") if _ok(mid) else None,
+            html.Div(className="rng-dot", style={"left": f"{pos(val):.1f}%"},
+                     title=f"Price {_price(val)}"),
+        ), className="rng-track"),
+    ], className="rng")
+
+
+def _snapshot(sym: str):
+    """Key-stats panel for a single selected stock."""
+    rows = fetch_fundamentals([sym])
+    if not rows:
+        return []
+    r = rows[0]
+    cash, debt = r.get("Cash"), r.get("Debt")
+    net_cash = cash - debt if _ok(cash) and _ok(debt) else None
+    ed = _earnings_in(r.get("Earnings"))
+    stat = lambda k, v, cls="": html.Div([html.Div(k, className="snap-k"),
+                                          html.Div(v, className=_cx("snap-v", cls))])
+    # margins/growth beyond ±1000% (pre-revenue companies) aren't meaningful
+    pctv = lambda v: ("n/m" if abs(v) >= 1000 else _pct(v, 1).lstrip("+")) if _ok(v) else "—"
+    signed_large = lambda v: ("−" if v < 0 else "") + _large(abs(v)) if _ok(v) else "—"
+    n_an = r.get("Analysts")
+    return html.Div(_kids(
+        html.Div([html.Span(r["Ticker"], className="snap-sym"),
+                  html.Span(r.get("Company", ""), className="snap-name"),
+                  html.Span(" · ".join(x for x in (r.get("Sector"), r.get("Industry")) if x),
+                            className="snap-ind")], className="snap-head"),
+        html.Div(_kids(
+            _range_bar(r.get("52W Low"), r.get("52W High"), r.get("Price"), "52W low", "high"),
+            _range_bar(r.get("Target Low"), r.get("Target High"), r.get("Price"),
+                       f"{r.get('Rating') or 'Analyst'} target low", "high", mid=r.get("Target")),
+        ), className="snap-bars"),
+        html.Div([
+            stat("Market cap", _large(r.get("Market Cap"))),
+            stat("EV / EBITDA", _num(r.get("EV/EBITDA")) if _ok(r.get("EV/EBITDA")) and r["EV/EBITDA"] > 0 else "n/m"),
+            stat("P/E · Fwd", " · ".join(
+                ("n/m" if v <= 0 else _num(v)) if _ok(v) else "—"
+                for v in (r.get("P/E"), r.get("Fwd P/E")))),
+            stat("PT upside", _pct(r.get("Upside %"), 1), _tone(r.get("Upside %"))),
+            stat("Rev growth", pctv(r.get("Rev Growth %")), _tone(r.get("Rev Growth %"))),
+            stat("Gross margin", pctv(r.get("Gross Margin %"))),
+            stat("Op margin", pctv(r.get("Op Margin %")), _tone(r.get("Op Margin %"))),
+            stat("Free cash flow", signed_large(r.get("FCF")), _tone(r.get("FCF"))),
+            stat("Net cash", signed_large(net_cash), _tone(net_cash)),
+            stat("Beta", _num(r.get("Beta"), 2)),
+            stat("Short float", pctv(r.get("Short %")),
+                 "amber" if _ok(r.get("Short %")) and r["Short %"] >= 10 else ""),
+            stat("Next earnings",
+                 time.strftime("%b %d", time.localtime(r["Earnings"])) + f" · {ed}d"
+                 if ed is not None else "—", "amber" if ed is not None and ed <= 14 else ""),
+        ], className="snap-grid"),
+        html.Div(f"Consensus from {int(n_an)} analysts · Yahoo Finance" if _ok(n_an) and n_an else
+                 "Yahoo Finance", className="field-hint"),
+    ), className="snapshot")
+
+
+def _compare_outputs(selected, xrange):
+    """(normalized fig, price fig, snapshot) for a compare panel."""
+    selected = list(selected or [])
+    n, p = _build_compare_charts(selected, xrange)
+    return n, p, (_snapshot(selected[0]) if len(selected) == 1 else [])
+
+
 def _build_compare_charts(selected: list, xrange=None):
     if not selected:
         return (_empty_fig("Select stocks to compare"),
                 _empty_fig("Click any card to chart it"))
-    return _compare_figs(get_histories_1y(selected), selected, xrange)
+    hists = get_histories_1y(list(selected) + ["^GSPC"])
+    bench = hists.get("^GSPC") if "^GSPC" not in selected else None
+    return _compare_figs(hists, selected, xrange, bench=bench)
 
 
 def _sector_bars_fig(mdata: dict, key: str):
@@ -1137,10 +1488,15 @@ COL_SPECS = {
     "52W Low":         ("52W low",    "price"),
     "52W Pos %":       ("52W pos",    "pos"),
     "Avg Volume":      ("Avg vol",    "vol"),
+    "Rating":          ("Consensus",  "text"),
+    "Target":          ("Target",     "price"),
+    "Upside %":        ("PT upside",  "pct"),
+    "Short %":         ("Short float", "pos1"),
+    "Earnings":        ("Next earnings", "date"),
 }
 SCREENER_COLS = ["Ticker", "Company", "Price", "1D %", "1W %", "1M %", "3M %", "6M %", "1Y %",
-                 "Market Cap", "P/E", "Fwd P/E", "PEG", "EPS", "Rev Growth %",
-                 "Profit Margin %", "52W Pos %", "Avg Volume"]
+                 "Market Cap", "P/E", "Fwd P/E", "PEG", "Rev Growth %", "Profit Margin %",
+                 "Rating", "Target", "Upside %", "Short %", "Earnings", "52W Pos %", "Avg Volume"]
 SECTOR_COLS   = ["Ticker", "Company", "Price", "1D %", "1M %", "1Y %", "Market Cap", "P/E",
                  "Fwd P/E", "EPS", "52W High", "52W Low", "52W Pos %", "Avg Volume"]
 ALL_US_COLS   = ["Ticker", "Company", "Price", "1D %", "1Y %", "Market Cap", "P/E", "Fwd P/E",
@@ -1150,6 +1506,7 @@ _FMT = {
     "price": Format(precision=2, scheme=Scheme.fixed, group=True).symbol(Symbol.yes).symbol_prefix("$"),
     "pct":   Format(precision=2, scheme=Scheme.fixed, sign=Sign.positive).symbol(Symbol.yes).symbol_suffix("%"),
     "pos":   Format(precision=0, scheme=Scheme.fixed).symbol(Symbol.yes).symbol_suffix("%"),
+    "pos1":  Format(precision=1, scheme=Scheme.fixed).symbol(Symbol.yes).symbol_suffix("%"),
     "num":   Format(precision=2, scheme=Scheme.fixed, group=True),
     "cap":   Format(precision=1, scheme=Scheme.fixed, group=True).symbol(Symbol.yes)
                  .symbol_prefix("$").symbol_suffix("B"),
@@ -1182,6 +1539,10 @@ def _table_rows(df: pd.DataFrame, srcs) -> list:
             if kind in ("ticker", "text"):
                 d[_col_id(s)] = str(v) if _ok(v) else ""
                 continue
+            if kind == "date":
+                d[_col_id(s)] = (time.strftime("%Y-%m-%d", time.localtime(v))
+                                 if _ok(v) and v > time.time() - 86400 else "")
+                continue
             try:
                 v = float(v)
             except (TypeError, ValueError):
@@ -1203,6 +1564,8 @@ def _table_props(srcs):
                  {"if": {"filter_query": f"{{{c}}} < 0", "column_id": c}, "color": RED}]
     return dict(
         sort_action="native",
+        export_format="csv",
+        export_headers="display",
         style_as_list_view=True,
         style_table={"overflowX": "auto", "minWidth": "100%"},
         style_cell={
@@ -1275,14 +1638,17 @@ markets_tab = html.Div([
                       [{"label": "1D", "value": "pct1d"}, {"label": "1W", "value": "pct1w"},
                        {"label": "1M", "value": "pct1m"}, {"label": "3M", "value": "pct3m"}],
                       "pct1d")),
-    ], className="grid-2"),
+    ], className="grid-2 mb"),
+    _panel(html.Div(id="div-movers", className="movers-grid"),
+           title="Today’s movers", sub="US stocks over $2B market cap"),
 ])
 
 # ── Compare panel (sticky charts beside the cards) ────────────────────────────
 def _compare_panel(prefix, height=250, extra=None):
     return html.Div(_kids(
         _panel([
-            html.Div("Change from start of view", className="chart-label"),
+            html.Div(id=f"div-{prefix}snapshot"),
+            html.Div("Change from start of view · dotted = S&P 500", className="chart-label"),
             dcc.Graph(id=f"graph-{prefix}normalized", config={"displayModeBar": False},
                       style={"height": f"{height}px"},
                       figure=_empty_fig("Select stocks to compare")),
@@ -1307,7 +1673,7 @@ screener_tab = html.Div([
     _panel(html.Div([
         _field("Tickers", dcc.Input(id="input-tickers", type="text", className="inp",
                                     placeholder="AAPL MSFT NVDA — leave blank for tickers.txt",
-                                    debounce=False), className="grow"),
+                                    debounce=False, **PERSIST), className="grow"),
         html.Div([html.Div("Watchlist", className="field-label"),
                   dcc.Dropdown(id="dd-watchlist", options=watchlist_options(load_watchlists()),
                                placeholder="Load a list…", clearable=True)],
@@ -1348,8 +1714,8 @@ def _filter_item(fid, label, unit, yfield, col):
         html.Div(_kids(html.Span(label + (f"  ({unit})" if unit else "")), tag),
                  className="field-label"),
         html.Div([
-            dcc.Input(id=f"f-{fid}-min", type="number", placeholder="Min", debounce=False),
-            dcc.Input(id=f"f-{fid}-max", type="number", placeholder="Max", debounce=False),
+            dcc.Input(id=f"f-{fid}-min", type="number", placeholder="Min", debounce=False, **PERSIST),
+            dcc.Input(id=f"f-{fid}-max", type="number", placeholder="Max", debounce=False, **PERSIST),
         ], className="range-row"),
     ], className="filter-item field")
 
@@ -1372,7 +1738,7 @@ filter_tab = html.Div([
                                      {"label": "Watchlist", "value": "watchlist"}], "all")),
             html.Div(_field("Tickers", dcc.Input(id="filter-input-tickers", type="text",
                                                  className="inp",
-                                                 placeholder="Blank = tickers.txt")),
+                                                 placeholder="Blank = tickers.txt", **PERSIST)),
                      id="filter-tickers-wrap", className="hidden", style={"marginTop": "12px"}),
             html.Div([html.Div("Presets", className="field-label"),
                       html.Div([html.Button(name, id=f"btn-preset-{k}", n_clicks=0, className="pill")
@@ -1389,8 +1755,9 @@ filter_tab = html.Div([
 
         html.Div([
             _panel([
+                html.Div(id="div-filter-snapshot"),
                 html.Div([
-                    html.Div([html.Div("Change from start of view", className="chart-label"),
+                    html.Div([html.Div("Change from start of view · dotted = S&P 500", className="chart-label"),
                               dcc.Graph(id="graph-filter-normalized", config={"displayModeBar": False},
                                         style={"height": "280px"},
                                         figure=_empty_fig("Select rows to compare"))]),
@@ -1497,6 +1864,40 @@ analyst_tab = html.Div([
     ], className="explore"),
 ])
 
+# ── Themes tab ────────────────────────────────────────────────────────────────
+THEME_WINDOWS = ["1D", "1W", "1M", "3M", "YTD", "1Y"]
+
+themes_tab = html.Div([
+    dcc.Store(id="store-themes",          data=None),
+    dcc.Store(id="store-theme-stocks",    data=None),
+    dcc.Store(id="store-theme-name",      data="ai-compute"),
+    dcc.Store(id="store-theme-selected",  data=[]),
+    dcc.Store(id="store-theme-xrange",    data=None),
+    dcc.Store(id="store-themechart-xrange", data=None),
+
+    _page_head("Themes",
+               "Equal-weight baskets for the AI-infrastructure trade · ★ = names in your watchlist", [
+        dcc.Loading(html.Div(id="theme-status", className="status"), type="dot", color=ACCENT),
+        _seg("seg-theme-window", [{"label": w, "value": w} for w in THEME_WINDOWS], "1M"),
+        _btn("Refresh", "btn-theme-refresh"),
+    ]),
+    html.Div(id="div-theme-tiles", className="theme-grid mb",
+             children=[html.Div(className="theme-tile", style={"height": "150px"}) for _ in THEMES]),
+    _panel(dcc.Graph(id="graph-themes-chart", config={"displayModeBar": False},
+                     style={"height": "360px"}, figure=_empty_fig("Loading…")),
+           title="Theme performance vs S&P 500",
+           sub="Equal-weight, rebalanced daily · % change from start of view · drag to zoom",
+           className="mb"),
+    html.Div([html.Div(id="theme-members-head", className="section-title"),
+              _btn("Clear selection", "btn-theme-clear", "btn-ghost")],
+             className="section-head"),
+    html.Div([
+        html.Div(id="div-theme-bubbles", className="card-grid",
+                 children=[_empty("Loading…")]),
+        _compare_panel("theme-"),
+    ], className="explore"),
+])
+
 # ── Root layout ───────────────────────────────────────────────────────────────
 app.layout = html.Div(className="app", children=[
     dcc.Store(id="store-watchlists", data=load_watchlists()),
@@ -1518,6 +1919,7 @@ app.layout = html.Div(className="app", children=[
                     selected_className="nav-tab--selected", children=content)
             for label, value, content in [
                 ("Markets",  "tab-markets",  markets_tab),
+                ("Themes",   "tab-themes",   themes_tab),
                 ("Screener", "tab-screener", screener_tab),
                 ("Filter",   "tab-filter",   filter_tab),
                 ("Sectors",  "tab-sectors",  sectors_tab),
@@ -1645,6 +2047,8 @@ _register_rescale(["graph-filter-normalized", "graph-filter-price"], [True, Fals
 _register_rescale(["graph-sector-normalized", "graph-sector-price"], [True, False], "store-sec-xrange")
 _register_rescale(["graph-news-normalized", "graph-news-price"], [True, False], "store-news-xrange")
 _register_rescale(["graph-an-normalized", "graph-an-price"], [True, False], "store-an-xrange")
+_register_rescale(["graph-themes-chart"], [True], "store-themechart-xrange")
+_register_rescale(["graph-theme-normalized", "graph-theme-price"], [True, False], "store-theme-xrange")
 
 # ── MARKETS CALLBACKS ─────────────────────────────────────────────────────────
 def _index_card(idx, info):
@@ -1670,12 +2074,29 @@ def _index_card(idx, info):
     Output("store-market-data",   "data"),
     Output("markets-status",      "children"),
     Output("div-ticker-strip",    "children"),
+    Output("div-movers",          "children"),
     Input("interval-markets",     "n_intervals"),
     Input("btn-markets-refresh",  "n_clicks"),
     State("store-mkt-xrange",     "data"),
 )
 def load_market_data(_ni, _nr, xrange):
-    mdata, hist_df = fetch_market_snapshot()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        movers_f = {k: pool.submit(fetch_movers, k)
+                    for k in ("day_gainers", "day_losers", "most_actives")}
+        mdata, hist_df = fetch_market_snapshot()
+        movers = {k: f.result() for k, f in movers_f.items()}
+    movers_ui = [
+        html.Div([html.Div(title, className="movers-title")] + [
+            html.Div([
+                html.Div([html.Span(m["Ticker"], className="mover-sym"),
+                          html.Span(m["Company"], className="mover-name")], className="mover-id"),
+                html.Span(_price(m["Price"]), className="mover-price"),
+                _chip(m["1D %"]),
+            ], className="mover-row") for m in movers.get(key, [])
+        ] + ([] if movers.get(key) else [_empty("Unavailable")]))
+        for key, title in (("day_gainers", "Top gainers"), ("day_losers", "Top losers"),
+                           ("most_actives", "Most active"))
+    ]
     ts = pd.Timestamp.now().strftime("%I:%M %p").lstrip("0")
     cards = [_index_card(x, mdata.get(x["symbol"], {})) for x in MARKET_INDICES]
 
@@ -1693,7 +2114,7 @@ def load_market_data(_ni, _nr, xrange):
             html.Span(_fmt_idx(info.get("price"), x["symbol"]), className="strip-val"),
             html.Span(_pct(info.get("pct1d")), className=_cx("strip-chg", _tone(info.get("pct1d")))),
         ], className="strip-item"))
-    return cards, chart, mdata, f"Updated {ts}", strip
+    return cards, chart, mdata, f"Updated {ts}", strip, movers_ui
 
 
 @app.callback(
@@ -1713,18 +2134,18 @@ def update_sector_bars(mdata, key):
     Output("store-selected", "data", allow_duplicate=True),
     Output("status-bar",     "children"),
     Input("btn-run",         "n_clicks"),
+    Input("main-tabs",       "value"),
     State("input-tickers",   "value"),
+    State("store-data",      "data"),
     prevent_initial_call=True,
 )
-def run_screener(_, ticker_input):
+def run_screener(_, tab, ticker_input, current):
+    trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+    # auto-load the watchlist the first time the tab is opened
+    if trigger.startswith("main-tabs") and (tab != "tab-screener" or current):
+        return no_update, no_update, no_update
     tickers = _parse_tickers(ticker_input) or load_tickers()
-    rows = []
-    for i, sym in enumerate(tickers):
-        row = fetch_ticker(sym)
-        if row:
-            rows.append(row)
-        if i < len(tickers) - 1:
-            time.sleep(0.3)
+    rows = fetch_fundamentals(tickers)
     if not rows:
         return no_update, no_update, html.Span("No data retrieved", className="status-warn")
     df = pd.DataFrame(rows)
@@ -1819,7 +2240,10 @@ def update_bubbles(store_json, selected, period):
         cards.append(_quote_card(
             t, "bubble", _sel_color(t, sel), company=rec.get("Company", ""),
             price=rec.get("Price"), change=rec.get("1D %"), spark=rec.get("Spark"),
-            stats=stats,
+            earnings=rec.get("Earnings"),
+            stats=stats, extra=_rating_block({"recKey": rec.get("recKey"),
+                                              "target": rec.get("Target"),
+                                              "upside": rec.get("Upside %")}),
         ))
     return cards
 
@@ -1827,12 +2251,13 @@ def update_bubbles(store_json, selected, period):
 @app.callback(
     Output("graph-normalized", "figure"),
     Output("graph-price",      "figure"),
+    Output("div-snapshot", "children"),
     Input("store-selected",    "data"),
     State("store-scr-xrange",  "data"),
     prevent_initial_call=True,
 )
 def update_charts(selected, xrange):
-    return _build_compare_charts(selected or [], xrange)
+    return _compare_outputs(selected, xrange)
 
 
 @app.callback(
@@ -1912,13 +2337,7 @@ def run_filter(_, universe, ticker_input, *filter_vals):
         msg = f"{len(df):,} matches · sorted by market cap · {ts}"
     else:
         tickers = _parse_tickers(ticker_input) or load_tickers()
-        rows = []
-        for i, sym in enumerate(tickers):
-            row = fetch_ticker(sym)
-            if row:
-                rows.append(row)
-            if i < len(tickers) - 1:
-                time.sleep(0.3)
+        rows = fetch_fundamentals(tickers)
         if not rows:
             return [], no_update, [], [], warn("No data retrieved")
         df = pd.DataFrame(rows)
@@ -1944,14 +2363,15 @@ def clear_filter_selection(_):
 @app.callback(
     Output("graph-filter-normalized", "figure"),
     Output("graph-filter-price",      "figure"),
+    Output("div-filter-snapshot",     "children"),
     Input("filter-table",     "selected_row_ids"),
     State("store-flt-xrange", "data"),
     prevent_initial_call=True,
 )
 def update_filter_charts(selected, xrange):
     if not selected:
-        return _empty_fig("Select rows to compare"), _empty_fig("Tick a row to chart it")
-    return _build_compare_charts(list(selected), xrange)
+        return _empty_fig("Select rows to compare"), _empty_fig("Tick a row to chart it"), []
+    return _compare_outputs(selected, xrange)
 
 # ── SECTOR CALLBACKS ──────────────────────────────────────────────────────────
 
@@ -2034,6 +2454,7 @@ def update_sector_display(store_json, selected):
         cards.append(_quote_card(
             t, "sector-bubble", _sel_color(t, sel), company=rec.get("Company", ""),
             price=rec.get("Price"), change=rec.get("1D %"), spark=rec.get("Spark"),
+            earnings=rec.get("Earnings"),
             stats=[("1M", _pct(m1), _tone(m1)), ("Cap", _large(rec.get("Market Cap")), "")],
         ))
     return cards, _make_table(df, SECTOR_COLS)
@@ -2042,12 +2463,13 @@ def update_sector_display(store_json, selected):
 @app.callback(
     Output("graph-sector-normalized", "figure"),
     Output("graph-sector-price",      "figure"),
+    Output("div-sector-snapshot", "children"),
     Input("store-sector-selected",    "data"),
     State("store-sec-xrange",         "data"),
     prevent_initial_call=True,
 )
 def update_sector_charts(selected, xrange):
-    return _build_compare_charts(selected or [], xrange)
+    return _compare_outputs(selected, xrange)
 
 # ── NEWS CALLBACKS ────────────────────────────────────────────────────────────
 
@@ -2102,6 +2524,7 @@ def update_news_bubbles(rows, selected):
             r["Ticker"], "news-bubble", _sel_color(r["Ticker"], sel),
             company=r.get("Company", ""), price=r.get("Price"), change=r.get("1D %"),
             spark=r.get("Spark"), badge="HOT" if r.get("Trending") else None,
+            earnings=r.get("Earnings"),
             stats=[("1M", _pct(r.get("1M %")), _tone(r.get("1M %"))),
                    ("", f"{n} article{'s' if n != 1 else ''}", "")],
             note=heads[0]["title"] if heads else None,
@@ -2112,12 +2535,13 @@ def update_news_bubbles(rows, selected):
 @app.callback(
     Output("graph-news-normalized", "figure"),
     Output("graph-news-price",      "figure"),
+    Output("div-news-snapshot", "children"),
     Input("store-news-selected",    "data"),
     State("store-news-xrange",      "data"),
     prevent_initial_call=True,
 )
 def update_news_charts(selected, xrange):
-    return _build_compare_charts(selected or [], xrange)
+    return _compare_outputs(selected, xrange)
 
 
 @app.callback(
@@ -2226,7 +2650,7 @@ def update_an_bubbles(rows, selected):
         cards.append(_quote_card(
             r["Ticker"], "an-bubble", _sel_color(r["Ticker"], sel),
             company=r.get("Company", ""), price=r.get("Price"), change=r.get("1D %"),
-            spark=r.get("Spark"), stats=stats, extra=_rating_block(r),
+            spark=r.get("Spark"), stats=stats, extra=_rating_block(r), earnings=r.get("Earnings"),
             note=_action_note(r["actions"][0]) if r["actions"] else None,
         ))
     return cards
@@ -2235,12 +2659,13 @@ def update_an_bubbles(rows, selected):
 @app.callback(
     Output("graph-an-normalized", "figure"),
     Output("graph-an-price",      "figure"),
+    Output("div-an-snapshot", "children"),
     Input("store-an-selected",    "data"),
     State("store-an-xrange",      "data"),
     prevent_initial_call=True,
 )
 def update_an_charts(selected, xrange):
-    return _build_compare_charts(selected or [], xrange)
+    return _compare_outputs(selected, xrange)
 
 
 @app.callback(
@@ -2271,6 +2696,161 @@ def update_an_detail(selected, mode, rows):
         arts.sort(key=lambda h: h["time"], reverse=True)
         return _headline_items(arts, sel), f"Headlines · {', '.join(sel)}"
     return _headline_items(fetch_analyst_headlines()), "Analyst headlines"
+
+
+# ── THEME CALLBACKS ───────────────────────────────────────────────────────────
+
+@app.callback(
+    Output("store-themes",       "data"),
+    Output("store-theme-stocks", "data"),
+    Output("graph-themes-chart", "figure"),
+    Output("theme-status",       "children"),
+    Input("main-tabs",           "value"),
+    Input("btn-theme-refresh",   "n_clicks"),
+    State("store-themes",        "data"),
+    State("store-themechart-xrange", "data"),
+    prevent_initial_call=True,
+)
+def load_themes(tab, _r, current, xrange):
+    trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+    if trigger.startswith("main-tabs") and (tab != "tab-themes" or current):
+        return no_update, no_update, no_update, no_update
+    themes, series, spx, spx_perf, stocks = build_themes()
+    if not themes:
+        return no_update, no_update, no_update, html.Span("Couldn’t load theme data",
+                                                          className="status-warn")
+    ids   = [t["id"] for t in themes]
+    names = {t["id"]: t["name"] for t in themes}
+    chart, _ = _compare_figs(series, ids, xrange, default_months=3, with_price=False,
+                             names=names, bench=spx)
+    # 8 series: legend below the plot so it doesn't collide with the range buttons
+    chart.update_layout(legend=dict(orientation="h", x=0, xanchor="left", y=-0.08,
+                                    yanchor="top"), margin=dict(l=4, r=4, t=40, b=40))
+    ts = pd.Timestamp.now().strftime("%I:%M %p").lstrip("0")
+    return ({"themes": themes, "spx": spx_perf}, stocks, chart,
+            f"{len(stocks)} stocks in {len(themes)} baskets · {ts}")
+
+
+def _theme_tile(t, window, spx, active):
+    v, b = t.get(window), (spx or {}).get(window)
+    rel = v - b if _ok(v) and _ok(b) else None
+    src = _spark_src(t["spark"], 96, 30)
+    return html.Div(
+        id={"type": "theme-tile", "theme": t["id"]}, n_clicks=0,
+        className=_cx("theme-tile", "is-selected" if active else ""),
+        children=_kids(
+            html.Div([html.Span(t["name"], className="theme-name"),
+                      html.Img(src=src, className="qcard-spark") if src else None],
+                     className="qcard-top"),
+            html.Div(t["desc"], className="qcard-name"),
+            html.Div([html.Span(_pct(v, 1), className=_cx("theme-ret", _tone(v))),
+                      html.Span(f"{window} · {'+' if (rel or 0) >= 0 else ''}{rel:.1f} pts vs S&P"
+                                if rel is not None else window, className="stat-k")],
+                     className="theme-retrow"),
+            html.Div(_kids(
+                html.Span([html.Span("Best ", className="stat-k"), html.Span(t["best"], className="stat-v up")])
+                if t.get("best") else None,
+                html.Span([html.Span("Worst ", className="stat-k"), html.Span(t["worst"], className="stat-v down")])
+                if t.get("worst") else None,
+                html.Span("★ " + " ".join(t["mine"]), className="badge badge-blue qcard-badges")
+                if t.get("mine") else None,
+            ), className="qcard-stats"),
+        ),
+    )
+
+
+@app.callback(
+    Output("div-theme-tiles",  "children"),
+    Input("store-themes",      "data"),
+    Input("seg-theme-window",  "value"),
+    Input("store-theme-name",  "data"),
+)
+def update_theme_tiles(data, window, active):
+    if not data:
+        return no_update
+    window = window or "1M"
+    themes = sorted(data["themes"], key=lambda t: -(t.get(window) if _ok(t.get(window)) else -1e9))
+    return [_theme_tile(t, window, data.get("spx"), t["id"] == active) for t in themes]
+
+
+@app.callback(
+    Output("store-theme-name",     "data"),
+    Output("store-theme-selected", "data", allow_duplicate=True),
+    Input({"type": "theme-tile", "theme": ALL}, "n_clicks"),
+    State("store-theme-name", "data"),
+    prevent_initial_call=True,
+)
+def pick_theme(_clicks, current):
+    ctx = callback_context
+    if not ctx.triggered or not ctx.triggered[0].get("value"):
+        return no_update, no_update
+    try:
+        tid = json.loads(ctx.triggered[0]["prop_id"].rsplit(".", 1)[0]).get("theme")
+    except Exception:
+        return no_update, no_update
+    if not tid or tid == current:
+        return no_update, no_update
+    return tid, []
+
+
+@app.callback(
+    Output("store-theme-selected", "data"),
+    Input("btn-theme-clear", "n_clicks"),
+    Input({"type": "theme-bubble", "ticker": ALL}, "n_clicks"),
+    State("store-theme-selected", "data"),
+    prevent_initial_call=True,
+)
+def update_theme_selection(_, _b, selected):
+    return _toggle_from_click(selected, "btn-theme-clear")
+
+
+@app.callback(
+    Output("div-theme-bubbles",  "children"),
+    Output("theme-members-head", "children"),
+    Input("store-theme-stocks",  "data"),
+    Input("store-theme-name",    "data"),
+    Input("store-theme-selected", "data"),
+)
+def update_theme_bubbles(stocks, tid, selected):
+    theme = THEME_BY_ID.get(tid or "ai-compute")
+    if not stocks or not theme:
+        return [_empty("Loading…")], ""
+    sel = selected or []
+    cards = []
+    for m in theme[3]:
+        r = stocks.get(m)
+        if not r:
+            continue
+        stats = [("1M", _pct(r.get("1M %")), _tone(r.get("1M %"))),
+                 ("YTD", _pct(r.get("YTD %"), 0), _tone(r.get("YTD %")))]
+        rating = None
+        if r.get("Rating"):
+            rating = html.Div(html.Div([
+                html.Span(r["Rating"], className=_cx("rating-label",
+                          "up" if "Buy" in r["Rating"] else "down" if "Sell" in r["Rating"] else "flat")),
+                html.Span(f"avg {r['RatingMean']:.1f} / 5" if _ok(r.get("RatingMean")) else "",
+                          className="stat-k"),
+                html.Span(_large(r.get("Market Cap")), className="rating-pt"),
+            ], className="rating-line"), className="rating")
+        cards.append(_quote_card(
+            m, "theme-bubble", _sel_color(m, sel), company=r.get("Company", ""),
+            price=r.get("Price"), change=r.get("1D %"), spark=r.get("Spark"),
+            stats=stats, extra=rating, earnings=r.get("Earnings"),
+        ))
+    head = [html.Span(theme[1]), html.Span(f"  ·  {theme[2]}", className="section-sub")]
+    return cards, head
+
+
+@app.callback(
+    Output("graph-theme-normalized", "figure"),
+    Output("graph-theme-price",      "figure"),
+    Output("div-theme-snapshot", "children"),
+    Input("store-theme-selected",    "data"),
+    State("store-theme-xrange",      "data"),
+    prevent_initial_call=True,
+)
+def update_theme_charts(selected, xrange):
+    return _compare_outputs(selected, xrange)
 
 
 def _warm_caches():
