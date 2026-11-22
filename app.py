@@ -558,6 +558,201 @@ def fetch_analyst_headlines() -> list:
         _ticker_news_cache["__analyst__"] = (time.time(), arts)
     return arts
 
+
+# ── Top News: the day's biggest market stories ───────────────────────────────
+# Wider macro queries on top of NEWS_QUERIES; articles that cover the same event
+# are grouped into one "story" and stories are ranked by how widely they're covered.
+BRIEF_QUERIES = [
+    "stock market today", "markets wrap", "S&P 500", "Federal Reserve", "interest rates",
+    "inflation", "jobs report", "economy", "recession", "Treasury yields", "tariffs",
+    "trade war", "oil prices", "gold price", "bitcoin", "earnings report", "earnings beat",
+    "guidance cut", "merger", "acquisition", "AI stocks", "chip stocks", "layoffs",
+    "bank stocks", "consumer spending", "housing market", "China economy", "geopolitics",
+]
+BRIEF_MAJOR = {"Bloomberg", "Reuters", "The Wall Street Journal", "CNBC", "Yahoo Finance",
+               "Barrons.com", "Financial Times", "Associated Press Finance", "MarketWatch",
+               "Fortune", "Investopedia", "The Information"}
+BRIEF_TOPICS = [   # first match wins, so the more specific topics come first
+    ("Fed & Rates",  r"\bfed\b|federal reserve|powell|rate cut|rate hike|interest rate|"
+                     r"treasur|yield|bond|fomc|central bank"),
+    ("Economy",      r"inflation|\bcpi\b|\bpce\b|jobs report|payroll|unemployment|jobless|"
+                     r"\bgdp\b|recession|economy|economic|consumer (spending|confidence|sentiment)|"
+                     r"retail sales|housing|mortgage|manufacturing"),
+    ("Policy & Trade", r"tariff|trade (war|deal)|sanction|white house|trump|congress|senate|"
+                     r"regulat|antitrust|\bsec\b|shutdown|election|lawsuit|ftc|doj"),
+    ("Energy & Commodities", r"\boil\b|crude|opec|natural gas|\bgold\b(?! rush)|silver|copper|commodit|energy"),
+    ("Crypto",       r"bitcoin|crypto|\bether(eum)?\b|\bbtc\b|stablecoin|blockchain"),
+    ("Deals",        r"merger|acqui|buyout|takeover|\bdeal\b|\bipo\b|spin.?off|stake"),
+    ("Earnings",     r"earnings|revenue|profit|quarter|\bq[1-4]\b|guidance|outlook|forecast|"
+                     r"results|beat|miss"),
+    ("Markets",      r"\bdow\b|nasdaq|s&p|wall street|rally|sell.?off|correction|bear market|"
+                     r"bull market|futures|volatil|\bvix\b|stocks? (fall|drop|rise|climb|slide|plunge)"),
+    ("Tech & AI",    r"\bai\b|artificial intelligence|chip|semiconductor|nvidia|software|cloud|"
+                     r"data center|openai"),
+]
+BRIEF_TOPIC_NAMES = [t for t, _ in BRIEF_TOPICS] + ["Other"]
+_BRIEF_TOPIC_RX   = [(t, re.compile(rx, re.I)) for t, rx in BRIEF_TOPICS]
+BRIEF_PULSE = [("^GSPC", "S&P 500"), ("^IXIC", "Nasdaq"), ("^DJI", "Dow"), ("^RUT", "Russell"),
+               ("^VIX", "VIX"), ("^TNX", "10-Yr"), ("CL=F", "Oil"), ("GC=F", "Gold"),
+               ("BTC-USD", "Bitcoin")]
+_BRIEF_STOP = set("""a an the and or of to in on for with at by from as is are was were be be
+    been it its this that these those after before over under into amid about than more most
+    new says said say could would will may might can just now why how what who when where
+    here there up down out off not no stock stocks shares share market markets today week
+    year years report reports first latest big top key amp vs""".split())
+_brief_cache: dict = {"ts": 0.0, "articles": []}
+# evergreen listicles and personal-finance pieces aren't "news"; they still count
+# toward ticker mentions but never become stories
+_BRIEF_EVERGREEN = re.compile(
+    r"\b(stocks?|picks?|names|etfs?) (to|that) (watch|buy|own|consider|hold|sell|double)|"
+    r"^(top|best|our pick|\d+ )|\btop \d+\b|\b\d+ (\w+ ){0,3}(stocks|etfs|dividend)\b|"
+    r"should you (buy|forget|sell)|time to buy|buy and hold|penny stocks|millionaire|retire|"
+    r"annuit|medicare|social security|looks cheap|may still be cheap|undervalued|"
+    r"\bis it a buy\b|\bbuy now\b|forever", re.I)
+
+
+def _brief_tokens(title: str) -> set:
+    words = re.findall(r"[a-z0-9&$%.']+", title.lower())
+    return {w.strip(".'") for w in words if len(w) > 2 and w not in _BRIEF_STOP}
+
+
+def _brief_topic(title: str) -> str:
+    for name, rx in _BRIEF_TOPIC_RX:
+        if rx.search(title):
+            return name
+    return "Other"
+
+
+def fetch_brief_articles(force: bool = False) -> list:
+    """Broad + macro articles, de-duplicated and newest first. Cached 10 minutes."""
+    if not force and _brief_cache["articles"] and time.time() - _brief_cache["ts"] < NEWS_CACHE_TTL:
+        return _brief_cache["articles"]
+    seen, arts = set(), []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        batches = list(pool.map(_search_news, BRIEF_QUERIES))
+    for batch in [fetch_news_articles(force=force)] + batches:
+        for a in batch:
+            key = a.get("link") or a.get("uuid")
+            if key and key not in seen and a.get("title"):
+                seen.add(key)
+                arts.append({**_article(a), "symbols": list(a.get("relatedTickers") or [])})
+    arts.sort(key=lambda h: h["time"], reverse=True)
+    if arts:
+        _brief_cache.update(ts=time.time(), articles=arts)
+    return arts
+
+
+def _cluster_stories(arts: list) -> list:
+    """Greedy grouping of articles that share most of their headline words."""
+    stories = []
+    for a in sorted(arts, key=lambda h: h["time"]):      # oldest first: seed = first report
+        toks = _brief_tokens(a["title"])
+        tks  = set(a["tickers"])
+        best, best_sim = None, 0.0
+        for s in stories:
+            inter = len(toks & s["tokens"])
+            sim   = inter / (len(toks | s["tokens"]) or 1)
+            if tks and tks & s["tickers"] and inter >= 2:
+                sim += 0.2                                # same company + same words
+            if sim > best_sim:
+                best, best_sim = s, sim
+        if best is not None and best_sim >= 0.34:
+            best["articles"].append(a)
+            best["tokens"] |= toks
+            best["tickers"] |= tks
+        else:
+            stories.append({"articles": [a], "tokens": set(toks), "tickers": set(tks),
+                            "seed": set(toks)})
+
+    # second pass: fold follow-up angles on the same company into the main story
+    # (e.g. five separate "Anthropic IPO ..." threads become one)
+    def _top_ticker(s):
+        c: dict = {}
+        for h in s["articles"]:
+            for t in h["tickers"]:
+                c[t] = c.get(t, 0) + 1
+        return max(c, key=c.get) if c else None
+
+    merged = []
+    for s in sorted(stories, key=lambda s: -len(s["articles"])):
+        top = _top_ticker(s)
+        # compare the two first headlines only, so one big story can't snowball
+        # and swallow everything that mentions the same ticker
+        host = next((m for m in merged if top and m["top"] == top
+                     and len(s["seed"] & m["seed"]) >= 2), None)
+        if host:
+            host["articles"] += s["articles"]
+            host["tokens"]   |= s["tokens"]
+        else:
+            merged.append({**s, "top": top})
+    return merged
+
+
+def build_top_news(hours: int, force: bool = False) -> dict:
+    """Ranked stories, topic counts, most-mentioned tickers and a market pulse."""
+    now    = time.time()
+    arts   = [a for a in fetch_brief_articles(force=force) if a["time"] >= now - hours * 3600]
+    out    = {"hours": hours, "n_articles": len(arts), "stories": [], "topics": {},
+              "tickers": [], "pulse": [], "ts": now}
+    if not arts:
+        return out
+
+    stories = []
+    for s in _cluster_stories([a for a in arts if not _BRIEF_EVERGREEN.search(a["title"])]):
+        items  = sorted(s["articles"], key=lambda h: (h["publisher"] not in BRIEF_MAJOR, -h["time"]))
+        lead   = items[0]
+        pubs   = list(dict.fromkeys(h["publisher"] for h in items if h["publisher"]))
+        latest = max(h["time"] for h in items)
+        age_h  = (now - latest) / 3600
+        tk_count: dict = {}
+        for h in items:
+            for t in h["tickers"]:
+                tk_count[t] = tk_count.get(t, 0) + 1
+        # breadth of coverage counts more than one outlet's pile of near-duplicates
+        score = (min(len(items), 2 * len(pubs)) + 2.5 * len(pubs)
+                 + 1.5 * any(p in BRIEF_MAJOR for p in pubs)
+                 + max(0.0, 2 - age_h / 12))
+        stories.append({
+            "title":     lead["title"], "link": lead["link"], "publisher": lead["publisher"],
+            "time":      latest, "first": min(h["time"] for h in items),
+            "topic":     next((t for t in (_brief_topic(h["title"]) for h in items[:3])
+                               if t != "Other"), "Other"),
+            "n":         len(items), "publishers": pubs,
+            "tickers":   sorted(tk_count, key=lambda t: -tk_count[t])[:6],
+            "related":   [{"title": h["title"], "link": h["link"], "publisher": h["publisher"],
+                           "time": h["time"]} for h in items[1:5]],
+            "score":     round(score, 2),
+        })
+    stories.sort(key=lambda s: (-s["score"], -s["time"]))
+    stories = stories[:60]
+    for s in stories:
+        out["topics"][s["topic"]] = out["topics"].get(s["topic"], 0) + 1
+
+    mentions: dict = {}
+    for a in arts:
+        for t in dict.fromkeys(a["tickers"]):
+            mentions[t] = mentions.get(t, 0) + 1
+    top_syms = sorted(mentions, key=lambda t: -mentions[t])[:30]
+    pulse_syms = [s for s, _ in BRIEF_PULSE]
+    story_syms = {t for s in stories[:25] for t in s["tickers"]}
+    quotes = {q["symbol"]: q for q in _yahoo.get_quotes(
+        list(dict.fromkeys(pulse_syms + top_syms + sorted(story_syms))))}
+
+    def _q(sym):
+        q = quotes.get(sym) or {}
+        return q.get("regularMarketPrice"), q.get("regularMarketChangePercent")
+
+    out["pulse"] = [{"symbol": s, "name": n, "price": _q(s)[0], "change": _q(s)[1]}
+                    for s, n in BRIEF_PULSE]
+    out["tickers"] = [
+        {"symbol": t, "name": (quotes.get(t) or {}).get("shortName") or "", "mentions": mentions[t],
+         "price": _q(t)[0], "change": _q(t)[1]}
+        for t in top_syms if (quotes.get(t) or {}).get("quoteType") in ("EQUITY", "ETF")
+    ][:15]
+    out["changes"] = {t: _q(t)[1] for t in story_syms if _ok(_q(t)[1])}
+    out["stories"] = stories
+    return out
+
 # ── Analyst coverage data ─────────────────────────────────────────────────────
 # Source: Yahoo Finance quoteSummary (no key) — dated upgrade/downgrade/price-target
 # history per stock, current rating distribution and consensus targets.
@@ -2597,6 +2792,35 @@ news_tab = html.Div([
     ], className="explore"),
 ])
 
+# ── Top News tab ──────────────────────────────────────────────────────────────
+top_news_tab = html.Div([
+    dcc.Store(id="store-top-data", data=None),
+
+    _page_head("Top News",
+               "The biggest market stories of the last 24–48 hours, grouped across outlets "
+               "and ranked by how widely they’re covered", [
+        dcc.Loading(html.Div(id="top-status", className="status"), type="dot", color=ACCENT),
+        _seg("seg-top-hours", [{"label": "24h", "value": 24}, {"label": "48h", "value": 48}], 48),
+        _btn("Refresh", "btn-top-refresh"),
+    ]),
+    html.Div(id="div-top-pulse", className="pulse-row"),
+    html.Div(id="div-top-kpis", className="kpi-row brief-kpis"),
+    html.Div([
+        _panel([
+            _seg("seg-top-topic", [{"label": t, "value": t} for t in ["All"] + BRIEF_TOPIC_NAMES],
+                 "All"),
+            html.Div(id="div-top-stories", className="story-list",
+                     children=[_empty("Loading news…")]),
+        ], title="Top stories", sub="Most-covered first · click a headline to read it"),
+        html.Div([
+            _panel(html.Div(id="div-top-topics"), title="By topic",
+                   sub="Share of the top stories"),
+            _panel(html.Div(id="div-top-tickers"), title="Most mentioned",
+                   sub="Stocks named most often in the coverage"),
+        ], className="brief-side"),
+    ], className="brief"),
+])
+
 # ── Analyst tab ───────────────────────────────────────────────────────────────
 analyst_tab = html.Div([
     dcc.Store(id="store-an-data",     data=None),
@@ -2786,6 +3010,7 @@ app.layout = html.Div(className="app", children=[
                     selected_className="nav-tab--selected", children=content)
             for label, value, content in [
                 ("Markets",  "tab-markets",  markets_tab),
+                ("Top News", "tab-top-news", top_news_tab),
                 ("Themes",   "tab-themes",   themes_tab),
                 ("Screener", "tab-screener", screener_tab),
                 ("Filter",   "tab-filter",   filter_tab),
@@ -3463,6 +3688,120 @@ def update_news_headlines(rows, selected):
                 pool.append(h)
     pool.sort(key=lambda h: h["time"], reverse=True)
     return _headline_items(pool, sel)
+
+
+# ── TOP NEWS CALLBACKS ────────────────────────────────────────────────────────
+
+@app.callback(
+    Output("store-top-data", "data"),
+    Output("top-status",     "children"),
+    Input("main-tabs",       "value"),
+    Input("btn-top-refresh", "n_clicks"),
+    Input("seg-top-hours",   "value"),
+    State("store-top-data",  "data"),
+    prevent_initial_call=True,
+)
+def load_top_news(tab, _refresh, hours, current):
+    trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+    if trigger.startswith("main-tabs") and (tab != "tab-top-news" or current):
+        return no_update, no_update
+    data = build_top_news(int(hours or 48), force=trigger.startswith("btn-top-refresh"))
+    ts = pd.Timestamp.now().strftime("%I:%M %p").lstrip("0")
+    if not data["stories"]:
+        return data, html.Span(f"No stories in the last {data['hours']}h", className="status-warn")
+    return data, f"{len(data['stories'])} stories from {data['n_articles']:,} articles · {ts}"
+
+
+def _story_card(rank: int, s: dict, changes: dict):
+    pubs = s["publishers"]
+    pub_txt = ", ".join(pubs[:4]) + (f" +{len(pubs) - 4} more" if len(pubs) > 4 else "")
+    tickers = [html.Span([html.Span(t, className="story-tk-sym"),
+                          html.Span(_pct(changes.get(t), 1),
+                                    className=f"story-tk-chg {_tone(changes.get(t))}")
+                          if _ok(changes.get(t)) else None], className="story-tk")
+               for t in s["tickers"][:5]]
+    related = None
+    if s["related"]:
+        related = html.Details([
+            html.Summary(f"More coverage ({s['n'] - 1})"),
+            html.Div(_headline_items([{**h, "tickers": []} for h in s["related"]]),
+                     className="story-related"),
+        ], className="story-more")
+    return html.Div([
+        html.Div(str(rank), className="story-rank"),
+        html.Div(_kids(
+            html.Div([
+                html.Span(s["topic"], className="badge badge-blue"),
+                html.Span(f"{s['n']} article{'s' if s['n'] != 1 else ''} · "
+                          f"{len(pubs)} source{'s' if len(pubs) != 1 else ''} · "
+                          f"{_time_ago(s['time'])}", className="story-meta"),
+            ], className="story-top"),
+            html.A(s["title"], href=s["link"], target="_blank", rel="noopener noreferrer",
+                   className="story-title"),
+            html.Div(pub_txt, className="story-pubs"),
+            html.Div(tickers, className="story-tks") if tickers else None,
+            related,
+        ), className="story-body"),
+    ], className="story")
+
+
+@app.callback(
+    Output("div-top-pulse",   "children"),
+    Output("div-top-kpis",    "children"),
+    Output("div-top-stories", "children"),
+    Output("div-top-topics",  "children"),
+    Output("div-top-tickers", "children"),
+    Input("store-top-data",   "data"),
+    Input("seg-top-topic",    "value"),
+)
+def render_top_news(data, topic):
+    if data is None:
+        loading = _empty("Loading news…")
+        return [], [], [loading], loading, loading
+    stories = data.get("stories") or []
+    changes = data.get("changes") or {}
+
+    pulse = [html.Div([
+        html.Div(p["name"], className="pulse-name"),
+        html.Div(_fmt_idx(p["price"], p["symbol"]) if p["symbol"] != "BTC-USD"
+                 else _price(p["price"]), className="pulse-price"),
+        _chip(p["change"]),
+    ], className="pulse") for p in data.get("pulse") or []]
+
+    topics = data.get("topics") or {}
+    named = {k: v for k, v in topics.items() if k != "Other"}
+    top_topic = max(named, key=named.get) if named else "—"
+    tk = (data.get("tickers") or [None])[0]
+    kpis = [
+        _kpi("Articles scanned", f"{data.get('n_articles', 0):,}"),
+        _kpi("Stories", f"{len(stories)}"),
+        _kpi("Biggest topic", top_topic),
+        _kpi("Most mentioned", tk["symbol"] if tk else "—", _tone(tk["change"]) if tk else ""),
+    ]
+
+    shown = [s for s in stories if topic in (None, "All") or s["topic"] == topic]
+    cards = [_story_card(i + 1, s, changes) for i, s in enumerate(shown[:30])]
+    if not cards:
+        cards = [_empty(f"No {topic} stories in this window" if stories else "No stories found",
+                        warn=not stories)]
+
+    total = sum(topics.values()) or 1
+    topic_rows = [html.Div([
+        html.Div(name, className="bar-label"),
+        html.Div(html.Div(className="bar-fill", style={"width": f"{n / total * 100:.0f}%"}),
+                 className="bar-track"),
+        html.Div(str(n), className="bar-val"),
+    ], className=_cx("bar-row", "is-active" if name == topic else ""))
+        for name, n in sorted(topics.items(), key=lambda kv: -kv[1])] or _empty("—")
+
+    ticker_rows = [html.Div([
+        html.Span(t["symbol"], className="mm-sym"),
+        html.Span(t["name"], className="mm-name", title=t["name"]),
+        html.Span(f"{t['mentions']}×", className="mm-count"),
+        _chip(t["change"]),
+    ], className="mm-row") for t in data.get("tickers") or []] or _empty("—")
+
+    return pulse, kpis, cards, topic_rows, ticker_rows
 
 
 # ── ANALYST CALLBACKS ─────────────────────────────────────────────────────────

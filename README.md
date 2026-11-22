@@ -31,6 +31,7 @@ On startup the app warms its caches in the background (analyst data, analyst hea
 | Tab | What it shows |
 |---|---|
 | **Markets** | Index and sector-ETF performance, today's movers (US stocks over $2B), and a compare chart |
+| **Top News** | The biggest market stories of the last 24 or 48 hours, grouped across outlets and ranked by how widely they're covered, with a market pulse, topic filter and most-mentioned stocks |
 | **Themes** | Thematic baskets (built around the AI-infrastructure watchlist) compared with the S&P 500 |
 | **Screener** | Your watchlist with fundamentals, a market map sized by market cap, and charts |
 | **Filter** | Filter a wider universe by fundamentals, then tick results to chart and compare them |
@@ -41,6 +42,10 @@ On startup the app warms its caches in the background (analyst data, analyst hea
 | **Learn** | Short investing lessons with live examples from your watchlist, plus quizzes and progress tracking |
 
 ### Screenshots
+
+**Top News**: the day's biggest stories, each with its sources, the stocks involved and how they moved
+
+![Top News tab](docs/screenshots/top-news.png)
 
 **Screener**: watchlist cards with price, analyst rating and price target
 
