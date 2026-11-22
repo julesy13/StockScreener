@@ -4,3 +4,4 @@ rich
 dash
 dash-bootstrap-components
 plotly
+requests

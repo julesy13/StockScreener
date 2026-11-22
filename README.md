@@ -5,13 +5,15 @@ A personal stock screener and markets dashboard built on free Yahoo Finance data
 - **Dashboard** (`app.py`): a Dash web app with charts, filters, news, analyst data and lessons. It runs in your browser and works on your phone over the same Wi-Fi.
 - **Command-line screener** (`screener.py`): prints a colored table of your watchlist in the terminal and exports it to `results.csv`.
 
+![Markets tab](docs/screenshots/markets.png)
+
 ## Setup
 
 Requires Python 3.10+.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\pip install -r requirements.txt requests
+.\.venv\Scripts\pip install -r requirements.txt
 ```
 
 ## Running the dashboard
@@ -37,6 +39,24 @@ On startup the app warms its caches in the background (analyst data, analyst hea
 | **Analysts** | Ratings, price targets and recent analyst actions |
 | **Deep Dive** | "This week's 10" picks, each with business summary, drivers, financial trends, leadership and SEC filings |
 | **Learn** | Short investing lessons with live examples from your watchlist, plus quizzes and progress tracking |
+
+### Screenshots
+
+**Screener**: watchlist cards with price, analyst rating and price target
+
+![Screener tab](docs/screenshots/screener.png)
+
+**Analysts**: the most-covered stocks, with upgrades, downgrades and recent actions
+
+![Analysts tab](docs/screenshots/analysts.png)
+
+**Deep Dive**: this week's 10 picks and a full company profile
+
+![Deep Dive tab](docs/screenshots/deep-dive.png)
+
+**Learn**: a lesson applied to your watchlist, with a lesson library and progress tracking
+
+![Learn tab](docs/screenshots/learn.png)
 
 ## Running the command-line screener
 
@@ -81,8 +101,7 @@ These are created as the app runs and are not committed (see `.gitignore`):
 - `results.csv`: the last command-line screener output
 - `analyst_cache.json`: cached analyst data
 - `weekly_picks.json`: the picks for each week
-
-`watchlists.json` (watchlists saved from the dashboard) is also created at runtime, but it isn't in `.gitignore`.
+- `watchlists.json`: watchlists saved from the dashboard
 
 ## Project layout
 
@@ -92,6 +111,7 @@ screener.py    Command-line screener
 filters.py     Filter logic for config.json
 lessons.py     Content for the Learn tab
 assets/        Dashboard stylesheet
+docs/          README screenshots
 ```
 
 ## Disclaimer
